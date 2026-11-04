@@ -19,25 +19,36 @@ type item struct {
 }
 
 // fixture is a schema of one namespace "a" with a table of items by uint64
-// key, a unique name index, a per-tag index, a weight counter and a silent
-// table, plus a namespace "b" with one table.
+// key, a unique name index, a per-tag index, a weight counter, a silent
+// table, and a silent table of jobs with a non-unique state index (the
+// item's Name) and a weight counter, plus a namespace "b" with one table.
 type fixture struct {
-	schema *Schema
-	items  *Table[uint64, item]
-	byName *Index[uint64, item]
-	byTag  *Index[uint64, item]
-	total  *Counter[uint64, item]
-	quiet  *Table[uint64, item]
-	other  *Table[uint64, item]
+	schema   *Schema
+	items    *Table[uint64, item]
+	byName   *Index[uint64, item]
+	byTag    *Index[uint64, item]
+	total    *Counter[uint64, item]
+	quiet    *Table[uint64, item]
+	jobs     *Table[uint64, item]
+	byState  *Index[uint64, item]
+	jobCount *Counter[uint64, item]
+	other    *Table[uint64, item]
 }
 
 func newFixture(t *testing.T) *fixture {
+	t.Helper()
+	return fixtureAt(t, 1)
+}
+
+// fixtureAt is the fixture with the items table's value codec at version v,
+// which changes only namespace a's digest.
+func fixtureAt(t *testing.T, v uint32) *fixture {
 	t.Helper()
 	s := NewSchema("test")
 	a := Must(s.Namespace("a"))
 	b := Must(s.Namespace("b"))
 	f := &fixture{schema: s}
-	f.items = Must(Define(a, 0x10, "items", Uint64Key{}, JSON[item](1), TableOptions{}))
+	f.items = Must(Define(a, 0x10, "items", Uint64Key{}, JSON[item](v), TableOptions{}))
 	f.byName = Must(DefineIndex(f.items, "by_name", IndexOptions{Unique: true, Version: 1}, func(_ uint64, v *item) []Entry {
 		if v.Name == "" {
 			return nil
@@ -53,6 +64,11 @@ func newFixture(t *testing.T) *fixture {
 	}))
 	f.total = Must(DefineCounter(f.items, "total", 1, func(_ uint64, v *item) int64 { return v.N }))
 	f.quiet = Must(Define(a, 0x11, "quiet", Uint64Key{}, JSON[item](1), TableOptions{Silent: true}))
+	f.jobs = Must(Define(a, 0x12, "jobs", Uint64Key{}, JSON[item](1), TableOptions{Silent: true}))
+	f.byState = Must(DefineIndex(f.jobs, "by_state", IndexOptions{Version: 1}, func(_ uint64, v *item) []Entry {
+		return []Entry{{Key: []byte(v.Name)}}
+	}))
+	f.jobCount = Must(DefineCounter(f.jobs, "job_weight", 1, func(_ uint64, v *item) int64 { return v.N }))
 	f.other = Must(Define(b, 0x20, "other", Uint64Key{}, JSON[item](1), TableOptions{}))
 	return f
 }
@@ -89,7 +105,11 @@ func view(t *testing.T, db *DB, fn func(*ReadTx) error) {
 func headRev(t *testing.T, db *DB) uint64 {
 	t.Helper()
 	var rev uint64
-	view(t, db, func(r *ReadTx) error { rev = r.Rev(); return nil })
+	view(t, db, func(r *ReadTx) error {
+		var err error
+		rev, err = r.Rev()
+		return err
+	})
 	return rev
 }
 

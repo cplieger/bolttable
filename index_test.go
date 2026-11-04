@@ -81,9 +81,9 @@ func TestNonUniqueEncodingDistinct(t *testing.T) {
 					t.Errorf("entries = %q, want %q", got, want)
 				}
 				for _, w := range want {
-					got := scanEntries(t, r, f.multi, Range{From: []byte(w.ikey), Reverse: true})
+					got := scanEntries(t, r, f.multi, Range{To: append([]byte(w.ikey), 0x00), Reverse: true})
 					if len(got) == 0 || got[0].ikey != w.ikey {
-						t.Errorf("reverse scan from %q starts at %q", w.ikey, got)
+						t.Errorf("reverse scan to %q plus 0x00 starts at %q", w.ikey, got)
 					}
 				}
 				return nil
@@ -148,8 +148,9 @@ func TestIndexScanPrefixFrom(t *testing.T) {
 		{"from inclusive of every entry", Range{From: []byte("a")}, []string{"1", "2", "3", "4", "5"}},
 		{"from between", Range{From: []byte("aa")}, []string{"3", "4", "5"}},
 		{"prefix with zero byte", Range{Prefix: []byte("b\x00")}, []string{"5"}},
-		{"reverse from", Range{From: []byte("ab"), Reverse: true}, []string{"3", "2", "1"}},
-		{"reverse from below zero byte", Range{From: []byte("b"), Reverse: true}, []string{"4", "3", "2", "1"}},
+		{"reverse from", Range{From: []byte("ab"), Reverse: true}, []string{"5", "4", "3"}},
+		{"reverse to", Range{To: []byte("b"), Reverse: true}, []string{"3", "2", "1"}},
+		{"reverse to above zero byte", Range{To: []byte("b\x00"), Reverse: true}, []string{"4", "3", "2", "1"}},
 		{"reverse prefix", Range{Prefix: []byte("b"), Reverse: true}, []string{"5", "4"}},
 	}
 	view(t, db, func(r *ReadTx) error {
@@ -158,8 +159,8 @@ func TestIndexScanPrefixFrom(t *testing.T) {
 				t.Errorf("%s: primaries = %q, want %q", tc.name, got, tc.want)
 			}
 		}
-		if got := pks(scanEntries(t, r, f.unique, Range{From: []byte("ab"), Reverse: true})); !slices.Equal(got, []string{"3", "1"}) {
-			t.Errorf("unique reverse from ab = %q, want 3 then 1", got)
+		if got := pks(scanEntries(t, r, f.unique, Range{To: []byte("b"), Reverse: true})); !slices.Equal(got, []string{"3", "1"}) {
+			t.Errorf("unique reverse to b = %q, want 3 then 1", got)
 		}
 		return nil
 	})
@@ -285,4 +286,106 @@ func TestOneRowTwoProjectionsFails(t *testing.T) {
 	if err := db.Update(t.Context(), func(tx *Tx) error { return tb.Put(tx, 1, &item{}) }); err == nil {
 		t.Error("Put stored one index key with two projections")
 	}
+}
+
+// putSplitRows stores one row per entry, keyed by its pk; unique rows also
+// take the index key as their unique key.
+func putSplitRows(t *testing.T, db *DB, f *splitFixture, rows []entryRow, unique bool) {
+	t.Helper()
+	update(t, db, func(tx *Tx) error {
+		for _, e := range rows {
+			row := &splitRow{IKey: []byte(e.ikey), Proj: []byte(e.proj)}
+			if unique {
+				row.UKey = row.IKey
+			}
+			if err := f.rows.Put(tx, []byte(e.pk), row); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func reversed(rows []entryRow) []entryRow {
+	out := slices.Clone(rows)
+	slices.Reverse(out)
+	return out
+}
+
+func TestNonUniqueIndexExact(t *testing.T) {
+	f := newSplitFixture()
+	db := mustOpen(t, tempPath(t), f.schema, Options{})
+	putSplitRows(t, db, f, []entryRow{{"a", "2", "x"}, {"a\x00", "3", "y"}, {"ab", "4", "z"}, {"b", "5", "w"}, {"a", "1", "v"}}, false)
+	want := []entryRow{{"a", "1", "v"}, {"a", "2", "x"}}
+	view(t, db, func(r *ReadTx) error {
+		if got := scanEntries(t, r, f.multi, Exact([]byte("a"))); !slices.Equal(got, want) {
+			t.Errorf("Exact(a) = %q, want %q", got, want)
+		}
+		rg := Exact([]byte("a"))
+		rg.Reverse = true
+		if got := scanEntries(t, r, f.multi, rg); !slices.Equal(got, reversed(want)) {
+			t.Errorf("Exact(a) reverse = %q, want %q", got, reversed(want))
+		}
+		if got := scanEntries(t, r, f.multi, Exact([]byte("a\x00"))); !slices.Equal(got, []entryRow{{"a\x00", "3", "y"}}) {
+			t.Errorf("Exact(a 0x00) = %q, want row 3 only", got)
+		}
+		if got := scanEntries(t, r, f.multi, Exact([]byte("c"))); got != nil {
+			t.Errorf("Exact(c) = %q, want none", got)
+		}
+		return nil
+	})
+}
+
+func TestNonUniqueIndexFromTo(t *testing.T) {
+	f := newSplitFixture()
+	db := mustOpen(t, tempPath(t), f.schema, Options{})
+	putSplitRows(t, db, f, []entryRow{{"\x00", "0", "p"}, {"a", "1", "x"}, {"a\x00", "2", "x"}, {"ab", "3", "x"}, {"b", "4", "x"}, {"b\x00", "5", "x"}}, false)
+	want := []entryRow{{"a", "1", "x"}, {"a\x00", "2", "x"}, {"ab", "3", "x"}}
+	view(t, db, func(r *ReadTx) error {
+		if got := scanEntries(t, r, f.multi, Range{From: []byte("a"), To: []byte("b")}); !slices.Equal(got, want) {
+			t.Errorf("[a, b) = %q, want %q", got, want)
+		}
+		if got := scanEntries(t, r, f.multi, Range{From: []byte("a"), To: []byte("b"), Reverse: true}); !slices.Equal(got, reversed(want)) {
+			t.Errorf("[a, b) reverse = %q, want %q", got, reversed(want))
+		}
+		if got := scanEntries(t, r, f.multi, Range{From: []byte("a\x00"), To: []byte("b\x00")}); !slices.Equal(got, []entryRow{{"a\x00", "2", "x"}, {"ab", "3", "x"}, {"b", "4", "x"}}) {
+			t.Errorf("[a 0x00, b 0x00) = %q, want rows 2, 3, 4", got)
+		}
+		if got := scanEntries(t, r, f.multi, Range{To: []byte("a")}); !slices.Equal(got, []entryRow{{"\x00", "0", "p"}}) {
+			t.Errorf("[, a) = %q, want row 0", got)
+		}
+		return nil
+	})
+}
+
+func TestUniqueIndexFromTo(t *testing.T) {
+	f := newSplitFixture()
+	db := mustOpen(t, tempPath(t), f.schema, Options{})
+	putSplitRows(t, db, f, []entryRow{{"a", "1", "x"}, {"a\x00", "2", "x"}, {"ab", "3", "x"}, {"b", "4", "x"}}, true)
+	want := []entryRow{{"a", "1", "x"}, {"a\x00", "2", "x"}, {"ab", "3", "x"}}
+	view(t, db, func(r *ReadTx) error {
+		if got := scanEntries(t, r, f.unique, Range{From: []byte("a"), To: []byte("b")}); !slices.Equal(got, want) {
+			t.Errorf("[a, b) = %q, want %q", got, want)
+		}
+		if got := scanEntries(t, r, f.unique, Range{From: []byte("a"), To: []byte("b"), Reverse: true}); !slices.Equal(got, reversed(want)) {
+			t.Errorf("[a, b) reverse = %q, want %q", got, reversed(want))
+		}
+		return nil
+	})
+}
+
+func TestUniqueIndexExact(t *testing.T) {
+	f := newSplitFixture()
+	db := mustOpen(t, tempPath(t), f.schema, Options{})
+	putSplitRows(t, db, f, []entryRow{{"a", "1", "x"}, {"a\x00", "2", "x"}, {"ab", "3", "x"}}, true)
+	view(t, db, func(r *ReadTx) error {
+		for _, reverse := range []bool{false, true} {
+			rg := Exact([]byte("a"))
+			rg.Reverse = reverse
+			if got := scanEntries(t, r, f.unique, rg); !slices.Equal(got, []entryRow{{"a", "1", "x"}}) {
+				t.Errorf("Exact(a), reverse %v = %q, want row 1 only", reverse, got)
+			}
+		}
+		return nil
+	})
 }

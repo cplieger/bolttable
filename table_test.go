@@ -5,6 +5,8 @@ import (
 	"errors"
 	"slices"
 	"testing"
+
+	"go.etcd.io/bbolt"
 )
 
 type bytesFixture struct {
@@ -46,9 +48,9 @@ func TestPutByteEqualWritesNothing(t *testing.T) {
 		t.Errorf("OnCommit ran %d times, want 1", got)
 	}
 	view(t, db, func(r *ReadTx) error {
-		changes, _, err := r.Since(0)
-		if err != nil || len(changes) != 1 {
-			t.Errorf("Since(0) = %v, %v; want the first Put only", changes, err)
+		page, err := r.Since(0, 100)
+		if err != nil || len(page.Changes) != 1 {
+			t.Errorf("Since(0) = %+v, %v; want the first Put only", page, err)
 		}
 		return nil
 	})
@@ -87,8 +89,10 @@ func TestScanPrefixFromReverse(t *testing.T) {
 		{"prefix from", Range{Prefix: []byte("a"), From: []byte("a2")}, []string{"a2", "a3"}},
 		{"from below prefix", Range{Prefix: []byte("b"), From: []byte("a")}, []string{"b1"}},
 		{"reverse prefix", Range{Prefix: []byte("a"), Reverse: true}, []string{"a3", "a2", "a1"}},
-		{"reverse from", Range{Prefix: []byte("a"), From: []byte("a2"), Reverse: true}, []string{"a2", "a1"}},
-		{"reverse from between keys", Range{From: []byte("a25"), Reverse: true}, []string{"a2", "a1"}},
+		{"reverse from", Range{Prefix: []byte("a"), From: []byte("a2"), Reverse: true}, []string{"a3", "a2"}},
+		{"reverse to", Range{Prefix: []byte("a"), To: []byte("a3"), Reverse: true}, []string{"a2", "a1"}},
+		{"reverse to between keys", Range{To: []byte("a25"), Reverse: true}, []string{"a2", "a1"}},
+		{"to between keys", Range{To: []byte("a25")}, []string{"a1", "a2"}},
 		{"reverse all", Range{Reverse: true}, []string{"\xff\xff\x01", "\xff\xff", "\xff\x01", "b1", "a3", "a2", "a1"}},
 		{"reverse prefix of 0xFF", Range{Prefix: []byte{0xff, 0xff}, Reverse: true}, []string{"\xff\xff\x01", "\xff\xff"}},
 		{"no match", Range{Prefix: []byte("c")}, nil},
@@ -238,7 +242,7 @@ func TestReturnedSlicesAreCopies(t *testing.T) {
 		if err := f.kv.Put(tx, key, val); err != nil {
 			return err
 		}
-		touched := Subject("touched")
+		touched := Synthetic([]byte("touched"))
 		tx.Touch(touched)
 		key[0], touched[0] = 'X', 'X'
 		val.Tags[0] = "mutated"
@@ -264,19 +268,20 @@ func TestReturnedSlicesAreCopies(t *testing.T) {
 	// A second write rewrites the change log from the bytes this
 	// transaction read, so a Since result sharing them would persist.
 	update(t, db, func(tx *Tx) error {
-		changes, _, err := tx.Read().Since(0)
+		page, err := tx.Read().Since(0, 100)
 		if err != nil {
 			return err
 		}
-		changes[0].Subjects[0][0] = 'Q'
+		page.Changes[0].Subjects[0][0] = 'Q'
 		return f.kv.Put(tx, []byte("second"), &item{Name: "second"})
 	})
 	view(t, db, func(r *ReadTx) error {
-		changes, _, err := r.Since(0)
+		page, err := r.Since(0, 100)
 		if err != nil {
 			return err
 		}
-		if !hasSubject(changes[0], f.kv.Subject([]byte("key"))) || !hasSubject(changes[0], Subject("touched")) {
+		changes := page.Changes
+		if !hasSubject(changes[0], f.kv.Subject([]byte("key"))) || !hasSubject(changes[0], Synthetic([]byte("touched"))) {
 			t.Errorf("stored change %q changed with the caller's slices", changes[0].Subjects)
 		}
 		got, found, err := f.kv.Get(r, []byte("key"))
@@ -312,4 +317,220 @@ func TestReadAfterTransactionFails(t *testing.T) {
 	if err := f.items.Put(tx, 1, &item{}); !errors.Is(err, errClosed) {
 		t.Errorf("Put on an ended Tx = %v, want errClosed", err)
 	}
+}
+
+func TestTableScanFromTo(t *testing.T) {
+	f := newBytesFixture()
+	db := mustOpen(t, tempPath(t), f.schema, Options{})
+	update(t, db, func(tx *Tx) error {
+		for k := '1'; k <= '9'; k++ {
+			if err := f.kv.Put(tx, []byte{byte(k)}, &item{Name: string(k)}); err != nil {
+				return err
+			}
+		}
+		return f.kv.Put(tx, []byte("55"), &item{Name: "55"})
+	})
+	b := func(s string) []byte { return []byte(s) }
+	cases := []struct {
+		name string
+		rg   Range
+		want []string
+	}{
+		{"from to", Range{From: b("3"), To: b("7")}, []string{"3", "4", "5", "55", "6"}},
+		{"from to reverse", Range{From: b("3"), To: b("7"), Reverse: true}, []string{"6", "55", "5", "4", "3"}},
+		{"from only", Range{From: b("8")}, []string{"8", "9"}},
+		{"from only reverse", Range{From: b("8"), Reverse: true}, []string{"9", "8"}},
+		{"to only", Range{To: b("3")}, []string{"1", "2"}},
+		{"to only reverse", Range{To: b("3"), Reverse: true}, []string{"2", "1"}},
+		{"from equal to", Range{From: b("5"), To: b("5")}, nil},
+		{"from above to", Range{From: b("7"), To: b("3")}, nil},
+		{"from above to reverse", Range{From: b("7"), To: b("3"), Reverse: true}, nil},
+		{"empty to", Range{To: []byte{}}, nil},
+		{"prefix inside", Range{Prefix: b("5"), From: b("3"), To: b("7")}, []string{"5", "55"}},
+		{"prefix cut by to", Range{Prefix: b("5"), To: b("55")}, []string{"5"}},
+		{"prefix cut by to reverse", Range{Prefix: b("5"), To: b("55"), Reverse: true}, []string{"5"}},
+		{"prefix cut by from", Range{Prefix: b("5"), From: b("50")}, []string{"55"}},
+		{"prefix outside", Range{Prefix: b("8"), To: b("7")}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scanKeys(t, db, f.kv, tc.rg); !slices.Equal(got, tc.want) {
+				t.Errorf("keys = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	t.Run("delete while scanning reverse", func(t *testing.T) {
+		var seen []string
+		update(t, db, func(tx *Tx) error {
+			return f.kv.Scan(tx.Read(), Range{From: b("2"), To: b("4"), Reverse: true}, func(k []byte, _ *item) (bool, error) {
+				seen = append(seen, string(k))
+				_, err := f.kv.Delete(tx, k)
+				return true, err
+			})
+		})
+		if !slices.Equal(seen, []string{"3", "2"}) {
+			t.Errorf("visited %q while deleting, want 3 then 2", seen)
+		}
+	})
+}
+
+func TestTableScanExact(t *testing.T) {
+	f := newBytesFixture()
+	db := mustOpen(t, tempPath(t), f.schema, Options{})
+	update(t, db, func(tx *Tx) error {
+		for _, k := range []string{"4", "5", "5\x00", "55", "6"} {
+			if err := f.kv.Put(tx, []byte(k), &item{Name: k}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	for _, reverse := range []bool{false, true} {
+		rg := Exact([]byte("5"))
+		rg.Reverse = reverse
+		if got := scanKeys(t, db, f.kv, rg); !slices.Equal(got, []string{"5"}) {
+			t.Errorf("Exact(5), reverse %v = %q, want only 5", reverse, got)
+		}
+	}
+	if got := scanKeys(t, db, f.kv, Exact([]byte("7"))); got != nil {
+		t.Errorf("Exact of an absent key = %q, want none", got)
+	}
+	key := []byte("5")
+	rg := Exact(key)
+	key[0] = '6'
+	if got := scanKeys(t, db, f.kv, rg); !slices.Equal(got, []string{"5"}) {
+		t.Errorf("Exact after its input changed = %q, want 5: Exact must copy", got)
+	}
+}
+
+// jobsInState returns the keys the by_state index lists for state.
+func jobsInState(t *testing.T, r *ReadTx, f *fixture, state string) []uint64 {
+	t.Helper()
+	var keys []uint64
+	if err := f.byState.Scan(r, Exact([]byte(state)), func(_ []byte, k uint64, _ []byte) (bool, error) {
+		keys = append(keys, k)
+		return true, nil
+	}); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	return keys
+}
+
+func TestSilentTableIndexAndCounter(t *testing.T) {
+	f := newFixture(t)
+	var rec recorder
+	db := mustOpen(t, tempPath(t), f.schema, Options{OnCommit: rec.on, Retention: 10})
+	update(t, db, func(tx *Tx) error { return f.items.Put(tx, 1, &item{Name: "row"}) })
+	check := func(step string, queued, running []uint64, weight int64) {
+		t.Helper()
+		view(t, db, func(r *ReadTx) error {
+			if got := jobsInState(t, r, f, "queued"); !slices.Equal(got, queued) {
+				t.Errorf("%s: queued = %v, want %v", step, got, queued)
+			}
+			if got := jobsInState(t, r, f, "running"); !slices.Equal(got, running) {
+				t.Errorf("%s: running = %v, want %v", step, got, running)
+			}
+			if n, err := f.jobCount.Value(r); n != weight || err != nil {
+				t.Errorf("%s: job weight = %d, %v; want %d", step, n, err, weight)
+			}
+			if rev, err := r.Rev(); rev != 1 || err != nil {
+				t.Errorf("%s: Rev = %d, %v; want 1", step, rev, err)
+			}
+			if page, err := r.Since(0, 10); err != nil || len(page.Changes) != 1 {
+				t.Errorf("%s: Since(0) = %+v, %v; want the one non-silent change", step, page, err)
+			}
+			return nil
+		})
+	}
+	commits := stats(t, db).Commits
+	steps := []struct {
+		name            string
+		write           func(tx *Tx) error
+		queued, running []uint64
+		weight          int64
+	}{
+		{"put", func(tx *Tx) error {
+			if err := f.jobs.Put(tx, 1, &item{Name: "queued", N: 2}); err != nil {
+				return err
+			}
+			return f.jobs.Put(tx, 2, &item{Name: "queued", N: 5})
+		}, []uint64{1, 2}, nil, 7},
+		{"move", func(tx *Tx) error { return f.jobs.Put(tx, 1, &item{Name: "running", N: 3}) }, []uint64{2}, []uint64{1}, 8},
+		{"delete", func(tx *Tx) error { _, err := f.jobs.Delete(tx, 2); return err }, nil, []uint64{1}, 3},
+	}
+	for _, s := range steps {
+		update(t, db, s.write)
+		check(s.name, s.queued, s.running, s.weight)
+		commits++
+		if got := stats(t, db).Commits; got != commits {
+			t.Errorf("%s: Commits = %d, want %d", s.name, got, commits)
+		}
+	}
+	if n := len(rec.all()); n != 1 {
+		t.Errorf("OnCommit ran %d times, want once for the non-silent write", n)
+	}
+}
+
+func TestVerifySilentTable(t *testing.T) {
+	path := tempPath(t)
+	f := newFixture(t)
+	db, err := Open(path, f.schema, Options{Retention: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	update(t, db, func(tx *Tx) error {
+		if err := f.jobs.Put(tx, 1, &item{Name: "queued", N: 2}); err != nil {
+			return err
+		}
+		return f.jobs.Put(tx, 2, &item{Name: "running", N: 3})
+	})
+	view(t, db, func(r *ReadTx) error {
+		if got := jobsInState(t, r, f, "queued"); !slices.Equal(got, []uint64{1}) {
+			t.Errorf("queued before the damage = %v, want [1]", got)
+		}
+		if n, _ := f.jobCount.Value(r); n != 5 {
+			t.Errorf("job weight before the damage = %d, want 5", n)
+		}
+		return nil
+	})
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rawUpdate(t, path, func(btx *bbolt.Tx) error {
+		a := nsBucket(btx, "a")
+		entry := append(append([]byte("queued"), nonUniqueEnd...), Uint64Key{}.AppendKey(nil, 1)...)
+		if err := a.Bucket([]byte("index:by_state")).Delete(entry); err != nil {
+			return err
+		}
+		return a.Put([]byte("counter:job_weight"), encodeTotal(40))
+	})
+	f = newFixture(t)
+	db = mustOpen(t, path, f.schema, Options{Retention: 10})
+	rep, err := db.Verify(t.Context(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := byName(rep)
+	want := map[string]Mismatch{
+		"a.by_state":   {Name: "a.by_state", Missing: 1, Repaired: true},
+		"a.job_weight": {Name: "a.job_weight", Missing: 1, Extra: 1, Repaired: true},
+	}
+	if len(got) != len(want) || got["a.by_state"] != want["a.by_state"] || got["a.job_weight"] != want["a.job_weight"] {
+		t.Errorf("mismatches = %+v, want %+v", rep.Mismatches, want)
+	}
+	if rep, _ := db.Verify(t.Context(), false); len(rep.Mismatches) != 0 {
+		t.Errorf("after repair: %+v", rep.Mismatches)
+	}
+	view(t, db, func(r *ReadTx) error {
+		if got := jobsInState(t, r, f, "queued"); !slices.Equal(got, []uint64{1}) {
+			t.Errorf("queued after repair = %v, want [1]", got)
+		}
+		if n, _ := f.jobCount.Value(r); n != 5 {
+			t.Errorf("job weight after repair = %d, want 5", n)
+		}
+		if rev, err := r.Rev(); rev != 0 || err != nil {
+			t.Errorf("Rev after repair = %d, %v; want 0", rev, err)
+		}
+		return nil
+	})
 }

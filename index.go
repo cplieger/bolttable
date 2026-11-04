@@ -99,25 +99,18 @@ func (ix *Index[K, V]) Lookup(r *ReadTx, key []byte) (k K, proj []byte, found bo
 }
 
 // Scan calls fn for each entry whose index key falls in rg, in index-key
-// order, until fn returns false or an error. Range compares index keys, so a
-// resumable scan needs an index key unique per row.
-func (ix *Index[K, V]) Scan(r *ReadTx, rg Range, fn func(ikey []byte, k K, proj []byte) (bool, error)) error {
+// order, until fn returns false or an error.
+func (ix *Index[K, V]) Scan(r *ReadTx, rg Range, fn func(ikey []byte, k K, proj []byte) (bool, error)) error { //nolint:gocritic // hugeParam: callers build a Range inline
 	ib, err := r.index(ix.def)
 	if err != nil {
 		return err
 	}
-	cr := cursorRange{prefix: rg.Prefix, lo: rg.From, reverse: rg.Reverse}
-	if ix.def.unique {
-		if rg.From != nil {
-			cr.hi = append(bytes.Clone(rg.From), 0)
-		}
-	} else {
-		cr.prefix = escapeKey(rg.Prefix)
-		if rg.From != nil {
-			cr.lo = escapeKey(rg.From)
-			// Every entry of key From sorts below From's escape plus 0x00 0x02.
-			cr.hi = append(escapeKey(rg.From), 0x00, 0x02)
-		}
+	cr := cursorRange{prefix: rg.Prefix, lo: rg.From, hi: rg.To, reverse: rg.Reverse}
+	if !ix.def.unique {
+		// Escaping keeps index-key order on stored keys: an index key's
+		// entries sort at or above its escape and below the escape of every
+		// greater key (nonUniqueEnd sorts below every escaped byte).
+		cr.prefix, cr.lo, cr.hi = escapeKey(rg.Prefix), escapeBound(rg.From), escapeBound(rg.To)
 	}
 	return scanBucket(ib, &cr, r.btx.Writable(), func(sk, sv []byte) (bool, error) {
 		ikey, pk, proj, ok := ix.def.split(sk, sv)
@@ -173,6 +166,14 @@ func (d *indexDef) pairs(entries []Entry, pk []byte) (map[string][]byte, error) 
 		m[string(k)] = v
 	}
 	return m, nil
+}
+
+// escapeBound escapes a range bound, keeping nil as no bound.
+func escapeBound(k []byte) []byte {
+	if k == nil {
+		return nil
+	}
+	return escapeKey(k)
 }
 
 func escapeKey(k []byte) []byte {

@@ -32,6 +32,10 @@ func TestDeclarationErrors(t *testing.T) {
 			_, err := s.Namespace("bolttable")
 			return err
 		}},
+		{"synthetic prefix", "reserved for synthetic subjects", func(s *Schema) error {
+			_, err := table(Must(s.Namespace("a")), SyntheticPrefix, "x")
+			return err
+		}},
 		{"duplicate prefix across namespaces", "reuses prefix 0x10", func(s *Schema) error {
 			Must(table(Must(s.Namespace("a")), 0x10, "x"))
 			_, err := table(Must(s.Namespace("b")), 0x10, "y")

@@ -14,7 +14,7 @@ import (
 // layoutNumber is the library's own on-disk layout: the library bucket's
 // keys, a namespace bucket's keys and the index and change encodings. A
 // change to any of them bumps it, which makes every older file a foreign
-// layout that ResetNamespaces must clear.
+// layout that Open must reset.
 const layoutNumber uint32 = 1
 
 var (

@@ -73,8 +73,9 @@ func pagesFault(r io.ReaderAt, size uint64) string {
 
 // readAt reads len(buf) bytes at off, which callers keep within the file,
 // whose size fits an int64.
-func readAt(r io.ReaderAt, buf []byte, off uint64) (int, error) {
-	return r.ReadAt(buf, int64(off)) //nolint:gosec // off is at most the file's size
+func readAt(r io.ReaderAt, buf []byte, off uint64) error {
+	_, err := r.ReadAt(buf, int64(off)) //nolint:gosec // off is at most the file's size
+	return err
 }
 
 // chosenMeta follows bbolt's open: the page size from the first valid meta
@@ -109,7 +110,7 @@ func metaPageSize(r io.ReaderAt, size uint64) (uint64, bool) {
 	var buf [0x1000]byte
 	readable := false
 	// ReadAt errs on any short read, so err alone gives bbolt's readable tests.
-	if _, err := readAt(r, buf[:], 0); err == nil {
+	if err := readAt(r, buf[:], 0); err == nil {
 		readable = true
 		if m, ok := decodeMeta(buf[:]); ok {
 			return uint64(m.pageSize), true
@@ -120,7 +121,7 @@ func metaPageSize(r io.ReaderAt, size uint64) (uint64, bool) {
 		if pos+1024 >= size {
 			break
 		}
-		if _, err := readAt(r, buf[:], pos); err == nil || errors.Is(err, io.EOF) {
+		if err := readAt(r, buf[:], pos); err == nil || errors.Is(err, io.EOF) {
 			readable = true
 			if m, ok := decodeMeta(buf[:]); ok {
 				return uint64(m.pageSize), true
@@ -138,7 +139,7 @@ type rawMeta struct {
 
 func readMetaAt(r io.ReaderAt, off uint64) (rawMeta, bool) {
 	var buf [pageHeaderSize + metaSize]byte
-	if _, err := readAt(r, buf[:], off); err != nil {
+	if err := readAt(r, buf[:], off); err != nil {
 		return rawMeta{}, false
 	}
 	return decodeMeta(buf[:])
@@ -194,7 +195,7 @@ func badFreelist(r io.ReaderAt, m fileMeta) string {
 func freelistIDs(r io.ReaderAt, m fileMeta) (ids []uint64, overflow uint64, why string) {
 	var hdr [pageHeaderSize + 8]byte
 	at := m.freelist * m.pageSize
-	if _, err := readAt(r, hdr[:], at); err != nil {
+	if err := readAt(r, hdr[:], at); err != nil {
 		return nil, 0, fmt.Sprintf("freelist page %d unreadable: %v", m.freelist, err)
 	}
 	le := binary.LittleEndian
@@ -214,7 +215,7 @@ func freelistIDs(r io.ReaderAt, m fileMeta) (ids []uint64, overflow uint64, why 
 		return nil, 0, fmt.Sprintf("freelist page %d counts %d ids, more than its pages hold", m.freelist, count)
 	}
 	raw := make([]byte, 8*count)
-	if _, err := readAt(r, raw, at+pageHeaderSize+8*first); err != nil {
+	if err := readAt(r, raw, at+pageHeaderSize+8*first); err != nil {
 		return nil, 0, fmt.Sprintf("freelist page %d unreadable: %v", m.freelist, err)
 	}
 	ids = make([]uint64, count)

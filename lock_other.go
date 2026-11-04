@@ -17,4 +17,4 @@ func tryLock(*os.File, bool) (bool, error) { return false, lockSupported() }
 
 func unlockFile(*os.File) error { return nil }
 
-func unlockBolt(*os.File) error { return nil }
+func unlockBolt(*os.File) {}

@@ -131,7 +131,7 @@ func openBolt(path, step string, o *bbolt.Options) (*bbolt.DB, *os.File, error) 
 // file description, and with it the flock, alive after f closes. The
 // mapping itself stays, since bbolt exposes no way to unmap it.
 func releaseFile(f *os.File) {
-	_ = unlockBolt(f)
+	unlockBolt(f)
 	_ = f.Close()
 }
 

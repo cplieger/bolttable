@@ -89,7 +89,7 @@ func (db *DB) deliver(s *commitSlot) {
 
 // abandon closes the slot of a call that failed, after every earlier slot's
 // callbacks ran. A nil slot is a call whose transaction never began.
-func (db *DB) abandon(s *commitSlot) {
+func (*DB) abandon(s *commitSlot) {
 	if s == nil {
 		return
 	}

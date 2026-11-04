@@ -14,17 +14,37 @@ type TableOptions struct {
 }
 
 // Subject names one row in the change feed: a table's prefix byte plus the
-// encoded key.
+// encoded key, or SyntheticPrefix plus caller-owned bytes for a subject
+// naming no row.
 type Subject []byte
 
-// Range selects the keys a Scan visits: those starting with Prefix, from
-// From onward (inclusive; when Reverse, From is the inclusive upper bound),
-// in byte order or, when Reverse, its reverse. Nil Prefix and From select
-// every key.
+// SyntheticPrefix starts every subject that names no row. Define refuses it.
+const SyntheticPrefix byte = 0xFF
+
+// Synthetic returns the subject SyntheticPrefix followed by a copy of key.
+func Synthetic(key []byte) Subject {
+	return append(Subject{SyntheticPrefix}, key...)
+}
+
+// Range selects keys k with Prefix as a prefix, From <= k (when From is not
+// nil) and k < To (when To is not nil), visited in byte order or, when
+// Reverse, in reverse. A table compares its encoded keys; an index compares
+// index keys, and a non-unique index visits a key's rows in primary-key
+// order. From >= To selects nothing. A page resumes exactly (forward: From
+// set to the last key plus 0x00; reverse: To set to the last key) only when
+// each key names one row: a table, a unique index, or a non-unique index
+// whose key carries something unique per row, such as a sequence.
 type Range struct {
 	Prefix  []byte
 	From    []byte
+	To      []byte
 	Reverse bool
+}
+
+// Exact selects exactly key: a table's one row, or every entry of an index
+// key, whether the index is unique or not. It copies key.
+func Exact(key []byte) Range {
+	return Range{From: append([]byte{}, key...), To: append(append([]byte{}, key...), 0x00)}
 }
 
 type tableDef struct {
@@ -64,7 +84,8 @@ type Table[K, V any] struct {
 
 // Define declares a table under a prefix byte unique across the schema and a
 // name unique in its namespace. It fails for a nil namespace or codec, a zero
-// codec version, a duplicate prefix or name, and after Open.
+// codec version, a duplicate prefix or name, SyntheticPrefix, and after
+// Open.
 func Define[K, V any](ns *Namespace, prefix byte, name string, k KeyCodec[K], v Codec[V], o TableOptions) (*Table[K, V], error) {
 	if ns == nil {
 		return nil, fmt.Errorf("bolttable: table %q in a nil namespace", name)
@@ -76,6 +97,9 @@ func Define[K, V any](ns *Namespace, prefix byte, name string, k KeyCodec[K], v 
 	err := ns.schema.declare("table "+ns.qualify(name), func() error {
 		if k.Version() == 0 || v.Version() == 0 {
 			return fmt.Errorf("bolttable: table %s has a zero codec version", ns.qualify(name))
+		}
+		if prefix == SyntheticPrefix {
+			return fmt.Errorf("bolttable: table %s: prefix 0x%02x is reserved for synthetic subjects", ns.qualify(name), prefix)
 		}
 		if other, dup := ns.schema.prefixes[prefix]; dup {
 			return fmt.Errorf("bolttable: table %s reuses prefix 0x%02x of %s", ns.qualify(name), prefix, other)
@@ -166,8 +190,8 @@ func (t *Table[K, V]) Subject(k K) Subject {
 
 // NextID returns the table's next sequence number, starting at 1. It records
 // no subject; on a non-silent table it fails the transaction inside
-// BeforeCommit, as a write does. After ResetNamespaces it stays above every
-// id the namespace issued before.
+// BeforeCommit, as a write does. After Open resets the namespace it stays
+// above every id the namespace issued before.
 func (t *Table[K, V]) NextID(tx *Tx) (uint64, error) {
 	if err := tx.writeCheck(t.def); err != nil {
 		return 0, err
@@ -182,16 +206,12 @@ func (t *Table[K, V]) NextID(tx *Tx) (uint64, error) {
 // Scan calls fn for each row in rg until fn returns false or an error. A key
 // or value that does not decode stops the scan with ErrCorrupt. Inside a
 // write transaction fn may write the table it scans.
-func (t *Table[K, V]) Scan(r *ReadTx, rg Range, fn func(K, *V) (bool, error)) error {
+func (t *Table[K, V]) Scan(r *ReadTx, rg Range, fn func(K, *V) (bool, error)) error { //nolint:gocritic // hugeParam: callers build a Range inline
 	b, err := r.rows(t.def)
 	if err != nil {
 		return err
 	}
-	var hi []byte
-	if rg.From != nil {
-		hi = append(bytes.Clone(rg.From), 0)
-	}
-	return scanBucket(b, &cursorRange{prefix: rg.Prefix, lo: rg.From, hi: hi, reverse: rg.Reverse}, r.btx.Writable(),
+	return scanBucket(b, &cursorRange{prefix: rg.Prefix, lo: rg.From, hi: rg.To, reverse: rg.Reverse}, r.btx.Writable(),
 		func(kb, vb []byte) (bool, error) {
 			k, err := t.key.ParseKey(bytes.Clone(kb))
 			if err != nil {

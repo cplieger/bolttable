@@ -11,8 +11,7 @@ import (
 const libBucket = "bolttable"
 
 // Schema is the set of namespaces a file holds. Declarations build it before
-// the first Open or ResetNamespaces; either seals it, and a declaration
-// after that fails.
+// the first Open, which seals it; a declaration after that fails.
 type Schema struct {
 	nsByName   map[string]*Namespace
 	prefixes   map[byte]string
@@ -102,3 +101,16 @@ func (ns *Namespace) claimName(name string) error {
 }
 
 func (ns *Namespace) qualify(name string) string { return ns.name + "." + name }
+
+// validSubject admits a non-empty subject whose first byte is a declared
+// table prefix or SyntheticPrefix. It reads prefixes without the lock: a
+// subject is checked only inside a transaction, after Open sealed s.
+func (s *Schema) validSubject(sub Subject) error {
+	if len(sub) == 0 {
+		return errors.New("bolttable: empty subject")
+	}
+	if _, ok := s.prefixes[sub[0]]; !ok && sub[0] != SyntheticPrefix {
+		return fmt.Errorf("bolttable: subject prefix 0x%02x names no table", sub[0])
+	}
+	return nil
+}

@@ -3,10 +3,15 @@ package bolttable
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"go.etcd.io/bbolt"
 )
@@ -49,23 +54,15 @@ func nextID(t *testing.T, db *DB, tb *Table[uint64, item]) uint64 {
 	return id
 }
 
-// resetAndOpen opens path under s, which must fail with a *FormatError,
-// resets every name it lists and opens again.
+// resetAndOpen opens path under s, whose format must differ, allowing the
+// reset of every name it lists.
 func resetAndOpen(t *testing.T, path string, s *Schema) *DB {
 	t.Helper()
-	_, err := Open(path, s, Options{})
-	var fe *FormatError
-	if !errors.As(err, &fe) {
-		t.Fatalf("Open = %v, want a *FormatError", err)
+	db := mustOpen(t, path, s, Options{Reset: allowAll})
+	if len(db.OpenReport().Reset) == 0 {
+		t.Fatal("Open reset nothing")
 	}
-	names := make([]string, 0, len(fe.Namespaces))
-	for _, n := range fe.Namespaces {
-		names = append(names, n.Name)
-	}
-	if err := ResetNamespaces(path, s, names); err != nil {
-		t.Fatalf("ResetNamespaces(%v): %v", names, err)
-	}
-	return mustOpen(t, path, s, Options{})
+	return db
 }
 
 func TestResetSeedsSequencesAcrossLayoutChanges(t *testing.T) {
@@ -160,6 +157,9 @@ func TestResetRemovedNamespace(t *testing.T) {
 	Must(DefineIndex(items, "by_tag", IndexOptions{Version: 1}, func(uint64, *item) []Entry { return nil }))
 	Must(DefineCounter(items, "total", 1, func(uint64, *item) int64 { return 0 }))
 	Must(Define(a, 0x11, "quiet", Uint64Key{}, JSON[item](1), TableOptions{Silent: true}))
+	jobs := Must(Define(a, 0x12, "jobs", Uint64Key{}, JSON[item](1), TableOptions{Silent: true}))
+	Must(DefineIndex(jobs, "by_state", IndexOptions{Version: 1}, func(uint64, *item) []Entry { return nil }))
+	Must(DefineCounter(jobs, "job_weight", 1, func(uint64, *item) int64 { return 0 }))
 	db = resetAndOpen(t, path, s)
 	view(t, db, func(r *ReadTx) error {
 		if r.btx.Bucket([]byte("b")) != nil {
@@ -172,61 +172,275 @@ func TestResetRemovedNamespace(t *testing.T) {
 	})
 }
 
-func TestResetUnknownNameErrors(t *testing.T) {
-	path := closedFile(t, newFixture(t).schema)
-	before := readFile(t, path)
-	if err := ResetNamespaces(path, newFixture(t).schema, []string{"a", "nowhere"}); err == nil {
-		t.Error("ResetNamespaces accepted a name neither stored nor declared")
-	}
-	if !bytes.Equal(before, readFile(t, path)) {
-		t.Error("a refused reset changed the file")
-	}
-	if err := ResetNamespaces(tempPath(t), newFixture(t).schema, []string{"a"}); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("reset of an absent file = %v, want fs.ErrNotExist", err)
-	}
-}
-
-func TestResetDeclaredNamespaceKeepsTheOther(t *testing.T) {
-	path := tempPath(t)
-	f := newFixture(t)
-	db, err := Open(path, f.schema, Options{})
+// keptCopies lists the .old copies of path, oldest first.
+func keptCopies(t *testing.T, path string) []string {
+	t.Helper()
+	m, err := filepath.Glob(path + ".*.*.old")
 	if err != nil {
 		t.Fatal(err)
 	}
-	update(t, db, func(tx *Tx) error {
-		if err := f.items.Put(tx, 1, &item{Name: "a", N: 4}); err != nil {
-			return err
-		}
-		return f.other.Put(tx, 1, &item{Name: "b"})
+	slices.Sort(m)
+	return m
+}
+
+func storedDigestOf(t *testing.T, path, name string) [32]byte {
+	t.Helper()
+	bdb, err := bbolt.Open(path, 0o600, &bbolt.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = bdb.Close() }()
+	var d [32]byte
+	_ = bdb.View(func(btx *bbolt.Tx) error {
+		copy(d[:], btx.Bucket([]byte(name)).Get(keyDigest))
+		return nil
 	})
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
+	return d
+}
+
+func TestOpenResetAllowedKeepsCopy(t *testing.T) {
+	path := storedFile(t)
+	storedA := storedDigestOf(t, path, "a")
+	storedB := storedDigestOf(t, path, "b")
+	before := readFile(t, path)
+	f2 := fixtureAt(t, 2)
+	db := mustOpen(t, path, f2.schema, Options{Reset: ResetPolicy{Allow: func(NamespaceDigest) bool { return true }, Keep: 2}})
+	rep := db.OpenReport()
+	want := []NamespaceDigest{{Name: "a", Stored: storedA, Want: f2.schema.digests()["a"]}}
+	if !slices.Equal(rep.Reset, want) {
+		t.Errorf("Reset = %+v, want %+v", rep.Reset, want)
 	}
-	if err := ResetNamespaces(path, newFixture(t).schema, []string{"a"}); err != nil {
-		t.Fatal(err)
+	if storedB != f2.schema.digests()["b"] {
+		t.Fatal("fixture: namespace b's digest changed with a's")
 	}
-	f = newFixture(t)
-	db = mustOpen(t, path, f.schema, Options{})
 	view(t, db, func(r *ReadTx) error {
-		if _, found, _ := f.items.Get(r, 1); found {
+		if _, found, _ := f2.items.Get(r, 1); found {
 			t.Error("the reset namespace kept its row")
 		}
-		if n, _ := f.total.Value(r); n != 0 {
-			t.Errorf("the reset namespace's counter = %d", n)
+		if v, found, _ := f2.other.Get(r, 1); !found || v.Name != "b" {
+			t.Errorf("namespace b's row = %+v, %v", v, found)
+		}
+		return nil
+	})
+	prefix := path + "." + hex.EncodeToString(storedA[:4]) + "."
+	stamp, ok := strings.CutPrefix(rep.Kept, prefix)
+	stamp, ok2 := strings.CutSuffix(stamp, ".old")
+	if !ok || !ok2 {
+		t.Fatalf("Kept = %q, want %s<stamp>.old", rep.Kept, prefix)
+	}
+	if _, err := time.Parse("20060102T150405.000000000Z", stamp); err != nil {
+		t.Errorf("Kept's stamp %q: %v", stamp, err)
+	}
+	if !bytes.Equal(before, readFile(t, rep.Kept)) {
+		t.Error("the kept copy is not the file before the reset")
+	}
+	if _, err := os.Stat(path + ".copy-tmp"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("copy-tmp left: %v", err)
+	}
+	f1 := newFixture(t)
+	old := mustOpen(t, rep.Kept, f1.schema, Options{})
+	view(t, old, func(r *ReadTx) error {
+		if v, found, _ := f1.items.Get(r, 1); !found || v.Name != "a" {
+			t.Errorf("the kept copy's row = %+v, %v", v, found)
+		}
+		return nil
+	})
+}
+
+func TestOpenResetKeepsNewestCopies(t *testing.T) {
+	path := storedFile(t)
+	dir := filepath.Dir(path)
+	unrelated := []string{
+		filepath.Join(dir, "x.old"), path + ".zz.old", path + ".0000000g.20000101T000000.000000000Z.old",
+		path + ".0000000A.20000101T000000.000000000Z.old", path + ".00000000.20000101T000000Z.old",
+		filepath.Join(dir, "other.bolt.00000000.20000101T000000.000000000Z.old"),
+	}
+	for _, u := range unrelated {
+		if err := os.WriteFile(u, []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var kept []string
+	for _, v := range []uint32{2, 1, 2} {
+		db := mustOpen(t, path, fixtureAt(t, v).schema, Options{Reset: ResetPolicy{Allow: func(NamespaceDigest) bool { return true }, Keep: 2}})
+		kept = append(kept, db.OpenReport().Kept)
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := slices.DeleteFunc(keptCopies(t, path), func(n string) bool { return slices.Contains(unrelated, n) })
+	if !slices.Equal(got, kept[1:]) {
+		t.Errorf(".old copies = %v, want the newest two %v", got, kept[1:])
+	}
+	for _, u := range unrelated {
+		if string(readFile(t, u)) != "keep" {
+			t.Errorf("%s changed", u)
+		}
+	}
+}
+
+func TestOpenResetNoCopy(t *testing.T) {
+	path := storedFile(t)
+	db := mustOpen(t, path, fixtureAt(t, 2).schema, Options{Reset: allowAll})
+	if rep := db.OpenReport(); len(rep.Reset) != 1 || rep.Kept != "" {
+		t.Errorf("report = %+v, want one reset and no copy", rep)
+	}
+	if m := keptCopies(t, path); len(m) != 0 {
+		t.Errorf(".old copies %v", m)
+	}
+	if _, err := os.Stat(path + ".copy-tmp"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("copy-tmp: %v", err)
+	}
+}
+
+func TestOpenResetRefusedWritesNothing(t *testing.T) {
+	var asked []string
+	cases := map[string]ResetPolicy{
+		"one refused": {Keep: 2, Force: []string{"a"}, Allow: func(n NamespaceDigest) bool {
+			asked = append(asked, n.Name)
+			return n.Name != "a"
+		}},
+		"nil Allow": {Keep: 2, Force: []string{"a"}},
+	}
+	for name, policy := range cases {
+		t.Run(name, func(t *testing.T) {
+			asked = nil
+			path := storedFile(t)
+			before := readFile(t, path)
+			_, err := Open(path, mismatchSchema(), Options{Reset: policy})
+			if _, ok := errors.AsType[*FormatError](err); !ok {
+				t.Fatalf("Open = %v, want a *FormatError", err)
+			}
+			if policy.Allow != nil && !slices.Equal(asked, []string{"a", "b"}) {
+				t.Errorf("Allow asked about %v, want a then b", asked)
+			}
+			if !bytes.Equal(before, readFile(t, path)) {
+				t.Error("a refused reset changed the file")
+			}
+			if m := keptCopies(t, path); len(m) != 0 {
+				t.Errorf(".old copies %v", m)
+			}
+		})
+	}
+}
+
+func TestOpenForceResetsMatchingNamespace(t *testing.T) {
+	path := storedFile(t)
+	storedA := storedDigestOf(t, path, "a")
+	f := newFixture(t)
+	db := mustOpen(t, path, f.schema, Options{Reset: ResetPolicy{Force: []string{"a", "a"}, Keep: 1}})
+	rep := db.OpenReport()
+	if want := []NamespaceDigest{{Name: "a", Stored: storedA, Want: storedA}}; !slices.Equal(rep.Reset, want) {
+		t.Errorf("Reset = %+v, want %+v", rep.Reset, want)
+	}
+	if rep.Kept == "" {
+		t.Error("no copy kept")
+	}
+	view(t, db, func(r *ReadTx) error {
+		if _, found, _ := f.items.Get(r, 1); found {
+			t.Error("the forced namespace kept its row")
 		}
 		if _, found, _ := f.other.Get(r, 1); !found {
 			t.Error("namespace b lost its row")
 		}
 		return nil
 	})
-	rawNames := []string{}
-	view(t, db, func(r *ReadTx) error {
-		return r.btx.ForEach(func(name []byte, _ *bbolt.Bucket) error {
-			rawNames = append(rawNames, string(name))
-			return nil
-		})
+}
+
+func TestOpenForceWithFormatErrorResetsOnce(t *testing.T) {
+	path := storedFile(t)
+	f2 := fixtureAt(t, 2)
+	db := mustOpen(t, path, f2.schema, Options{Reset: ResetPolicy{Allow: func(NamespaceDigest) bool { return true }, Force: []string{"b", "a", libBucket}}})
+	var names []string
+	for _, n := range db.OpenReport().Reset {
+		names = append(names, n.Name)
+	}
+	if !slices.Equal(names, []string{"a", "b", libBucket}) {
+		t.Errorf("reset %v, want a, b and bolttable once each", names)
+	}
+	if rev := headRev(t, db); rev != 0 {
+		t.Errorf("head after the library reset = %d, want 0", rev)
+	}
+}
+
+func TestOpenForceUnknownName(t *testing.T) {
+	path := storedFile(t)
+	before := readFile(t, path)
+	o := Options{Reset: ResetPolicy{Force: []string{"a", "nowhere"}, Keep: 1}}
+	if _, err := Open(path, newFixture(t).schema, o); err == nil || errors.Is(err, ErrFormat) || !strings.Contains(err.Error(), "nowhere") {
+		t.Errorf("Open = %v, want an error naming nowhere", err)
+	}
+	if !bytes.Equal(before, readFile(t, path)) {
+		t.Error("a refused Force changed the file")
+	}
+	if m := keptCopies(t, path); len(m) != 0 {
+		t.Errorf(".old copies %v", m)
+	}
+	t.Run("new file", func(t *testing.T) {
+		if _, err := Open(tempPath(t), newFixture(t).schema, o); err == nil || !strings.Contains(err.Error(), "nowhere") {
+			t.Errorf("Open of a new file = %v, want an error naming nowhere", err)
+		}
+		db := mustOpen(t, tempPath(t), newFixture(t).schema, Options{Reset: ResetPolicy{Force: []string{"a", libBucket}, Keep: 1}})
+		if rep := db.OpenReport(); len(rep.Reset) != 0 || rep.Kept != "" {
+			t.Errorf("a new file's report = %+v, want nothing reset", rep)
+		}
 	})
-	if !slices.Equal(rawNames, []string{"a", "b", libBucket}) {
-		t.Errorf("top-level buckets = %v", rawNames)
+}
+
+// failNthSync fails the nth directory sync with err: the copy's is the
+// first, the prune's the second.
+func failNthSync(n int, err error) func(string) error {
+	synced := 0
+	return func(dir string) error {
+		if synced++; synced == n {
+			return err
+		}
+		return syncDirectory(dir)
+	}
+}
+
+func TestOpenResetFailureLeavesFileUnreset(t *testing.T) {
+	boom := errors.New("boom")
+	cases := map[string]func(){
+		"copy": func() {
+			copyFile = func(_, dst string) error {
+				_ = os.WriteFile(dst, nil, 0o600)
+				return boom
+			}
+		},
+		"link":           func() { linkFile = func(string, string) error { return boom } },
+		"dir sync":       func() { syncDir = failNthSync(1, boom) },
+		"prune dir sync": func() { syncDir = failNthSync(2, boom) },
+		"prune": func() {
+			removeFile = func(name string) error {
+				if strings.HasSuffix(name, ".old") {
+					return boom
+				}
+				return os.Remove(name)
+			}
+		},
+	}
+	for name, inject := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := storedFile(t)
+			stale := path + ".00000000.20000101T000000.000000000Z.old"
+			if err := os.WriteFile(stale, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			before := readFile(t, path)
+			inject()
+			t.Cleanup(func() { copyFile, linkFile, syncDir, removeFile = copyFileSync, os.Link, syncDirectory, os.Remove })
+			_, err := Open(path, fixtureAt(t, 2).schema, Options{Reset: ResetPolicy{Allow: func(NamespaceDigest) bool { return true }, Keep: 1}})
+			if !errors.Is(err, boom) {
+				t.Errorf("Open = %v, want the injected failure", err)
+			}
+			if !bytes.Equal(before, readFile(t, path)) {
+				t.Error("the live file changed")
+			}
+			if _, err := os.Stat(path + ".copy-tmp"); !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("copy-tmp left: %v", err)
+			}
+			assertUnlocked(t, path)
+		})
 	}
 }

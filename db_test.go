@@ -1,8 +1,8 @@
 package bolttable
 
 import (
+	"errors"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -21,8 +21,8 @@ func TestBboltOptions(t *testing.T) {
 	if o.InitialMmapSize != 1<<30 {
 		t.Errorf("InitialMmapSize = %d, want 1 GiB", o.InitialMmapSize)
 	}
-	if o.Timeout != 5*time.Second {
-		t.Errorf("Timeout = %v, want 5s", o.Timeout)
+	if o.Timeout != time.Nanosecond {
+		t.Errorf("Timeout = %v, want 1ns, which bbolt tries once", o.Timeout)
 	}
 	if ro := boltOptions(true); !ro.ReadOnly || ro.NoFreelistSync || ro.FreelistType != bbolt.FreelistMapType {
 		t.Errorf("read-only options = %+v", ro)
@@ -46,19 +46,6 @@ func TestEpochDiffersPerOpen(t *testing.T) {
 	}
 	if first == second {
 		t.Errorf("two opens share epoch %x", first)
-	}
-}
-
-func TestSecondOpenTimesOut(t *testing.T) {
-	tuneBolt = func(o *bbolt.Options) { o.Timeout = 50 * time.Millisecond }
-	t.Cleanup(func() { tuneBolt = nil })
-	path := tempPath(t)
-	mustOpen(t, path, newFixture(t).schema, Options{})
-	if db, err := Open(path, newFixture(t).schema, Options{}); err == nil || !strings.Contains(err.Error(), "timeout") {
-		if db != nil {
-			_ = db.Close()
-		}
-		t.Errorf("second Open = %v, want a timeout", err)
 	}
 }
 
@@ -93,5 +80,41 @@ func TestOpenRefusesBadArguments(t *testing.T) {
 	}
 	if _, err := Open(tempPath(t), newFixture(t).schema, Options{Retention: -1}); err == nil {
 		t.Error("Open accepted a negative Retention")
+	}
+	path := tempPath(t)
+	if _, err := Open(path, newFixture(t).schema, Options{InvalidFile: InvalidFileMoveAside + 1}); err == nil {
+		t.Error("Open accepted an unknown InvalidFile policy")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a refused Open left a file: %v", err)
+	}
+}
+
+func TestBatchOptionsDefault(t *testing.T) {
+	db := mustOpen(t, tempPath(t), newFixture(t).schema, Options{})
+	if db.bolt.MaxBatchSize != 1000 || db.bolt.MaxBatchDelay != 10*time.Millisecond {
+		t.Errorf("batch limits = %d, %v; want 1000 and 10ms", db.bolt.MaxBatchSize, db.bolt.MaxBatchDelay)
+	}
+}
+
+func TestBatchOptionsApplied(t *testing.T) {
+	db := mustOpen(t, tempPath(t), newFixture(t).schema, Options{MaxBatchSize: 4, MaxBatchDelay: time.Hour})
+	if db.bolt.MaxBatchSize != 4 || db.bolt.MaxBatchDelay != time.Hour {
+		t.Errorf("batch limits = %d, %v; want 4 and 1h", db.bolt.MaxBatchSize, db.bolt.MaxBatchDelay)
+	}
+}
+
+func TestBatchOptionsNegativeRefused(t *testing.T) {
+	for name, o := range map[string]Options{"size": {MaxBatchSize: -1}, "delay": {MaxBatchDelay: -time.Millisecond}} {
+		t.Run(name, func(t *testing.T) {
+			path := tempPath(t)
+			if db, err := Open(path, newFixture(t).schema, o); err == nil {
+				_ = db.Close()
+				t.Fatal("Open accepted a negative batch limit")
+			}
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Errorf("a refused Open left a file: %v", err)
+			}
+		})
 	}
 }

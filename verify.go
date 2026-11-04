@@ -57,7 +57,7 @@ func (db *DB) Verify(ctx context.Context, repair bool) (VerifyReport, error) {
 	if !repair {
 		return rep, db.bolt.View(walk)
 	}
-	return rep, commit(db.bolt.Update, walk)
+	return rep, db.commit(db.bolt.Update, func(btx *bbolt.Tx, _ *commitSlot) error { return walk(btx) })
 }
 
 // rescan is what a table's rows derive: per index the stored pairs they

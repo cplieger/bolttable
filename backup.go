@@ -15,12 +15,14 @@ import (
 // copies before it commits, bounding the memory of a large copy.
 const backupTxBytes = 64 << 20
 
-// Test seams over the file-system steps of Backup and CompactIfFree.
+// Test seams over the file-system steps of Backup and Open.
 var (
 	removeFile = os.Remove
 	syncDir    = syncDirectory
 	backupWalk = func(string) {}
 	beforeSwap = func(string) error { return nil }
+	copyFile   = copyFileSync
+	linkFile   = os.Link
 )
 
 // createExclusive is bbolt's OpenFile for a backup's temporary file, so an
@@ -48,8 +50,8 @@ func (db *DB) Backup(ctx context.Context, path string) error {
 	}
 	dir, base := filepath.Split(path)
 	tmp := filepath.Join(dir, "."+base+".bolttable-tmp")
-	dst, err := bbolt.Open(tmp, 0o600, &bbolt.Options{
-		Timeout: openTimeout, FreelistType: bbolt.FreelistMapType, NoSync: true, OpenFile: createExclusive,
+	dst, err := boltOpen(tmp, 0o600, &bbolt.Options{
+		Timeout: boltTryOnce, FreelistType: bbolt.FreelistMapType, NoSync: true, OpenFile: createExclusive,
 	})
 	if err != nil {
 		if !errors.Is(err, fs.ErrExist) {

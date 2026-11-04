@@ -40,25 +40,29 @@ type ReadTx struct {
 
 // Update runs fn in one bbolt read-write transaction. fn's error, or one from
 // BeforeCommit, rolls it back and is returned as is; a failure of bbolt
-// itself wraps ErrCommit. A context already done runs nothing.
+// itself wraps ErrCommit. A context already done runs nothing and returns
+// ctx.Err() at once. Update returns after its own commit's callbacks ran; a
+// call that fails returns after the callbacks of the commits before it.
 func (db *DB) Update(ctx context.Context, fn func(*Tx) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return commit(db.bolt.Update, func(btx *bbolt.Tx) error { return db.run(btx, fn) })
+	return db.commit(db.bolt.Update, func(btx *bbolt.Tx, s *commitSlot) error { return db.run(ctx, btx, s, fn) })
 }
 
 // Batch is Update through bbolt's grouped commit: concurrent calls share one
-// transaction and fsync. fn may run more than once (bbolt reruns a group
+// transaction and fsync, in groups bounded by Options.MaxBatchSize and
+// MaxBatchDelay. fn may run more than once (bbolt reruns a group
 // after one call fails, and the failed call alone:
 // https://github.com/etcd-io/bbolt/blob/v1.5.0/db.go#L1024); only its last
 // run's writes, change and AfterCommit functions survive. Each call keeps its
-// own subjects, marks and revision.
+// own subjects, marks and revision; a group's callbacks run in the order its
+// calls ran. Batch returns as Update does.
 func (db *DB) Batch(ctx context.Context, fn func(*Tx) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return commit(db.bolt.Batch, func(btx *bbolt.Tx) error { return db.run(btx, fn) })
+	return db.commit(db.bolt.Batch, func(btx *bbolt.Tx, s *commitSlot) error { return db.run(ctx, btx, s, fn) })
 }
 
 // View runs fn in one read-only transaction. A context already done runs
@@ -76,20 +80,42 @@ type runError struct{ err error }
 
 func (e *runError) Error() string { return e.err.Error() }
 
-// commit runs fn through bbolt's Update or Batch and returns fn's error as
-// is, or bbolt's own failure wrapped in ErrCommit. The run's error is told
-// apart by its type, never compared: a caller's error may be uncomparable,
-// and a Batch call's earlier failed run may leave an error that its solo
-// rerun, failing to begin, never returns.
-func commit(through func(func(*bbolt.Tx) error) error, fn func(*bbolt.Tx) error) error {
+// faultError carries Options.CommitFault's error through bbolt, which rolls
+// the run back; commit reports it as a failed commit.
+type faultError struct{ err error }
+
+func (e *faultError) Error() string { return e.err.Error() }
+
+// commit runs fn through bbolt's Update or Batch, in btx's slot, and returns
+// fn's error as is, or bbolt's own failure wrapped in ErrCommit. On any error
+// it abandons the slot its last run used, so later commits stop waiting on
+// it. The run's error is told apart by its type, never compared: a caller's
+// error may be uncomparable, and a Batch call's earlier failed run may leave
+// an error that its solo rerun, failing to begin, never returns.
+func (db *DB) commit(through func(func(*bbolt.Tx) error) error, fn func(*bbolt.Tx, *commitSlot) error) error {
+	var last *commitSlot
 	err := through(func(btx *bbolt.Tx) error {
-		if err := fn(btx); err != nil {
-			return &runError{err: err}
+		last = db.slot(btx)
+		err := fn(btx, last)
+		if err == nil {
+			return nil
 		}
-		return nil
+		if _, fault := errors.AsType[*faultError](err); fault {
+			return err
+		}
+		return &runError{err: err}
 	})
+	if err == nil && last != nil && metaWithoutHandler != nil && metaWithoutHandler(last.txid) {
+		err = errSyncInjected
+	}
+	if err != nil {
+		db.abandon(last)
+	}
 	if re, ok := errors.AsType[*runError](err); ok {
 		return re.err
+	}
+	if fe, ok := errors.AsType[*faultError](err); ok {
+		return fmt.Errorf("%w: %w", ErrCommit, fe.err)
 	}
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrCommit, err)
@@ -97,7 +123,9 @@ func commit(through func(func(*bbolt.Tx) error) error, fn func(*bbolt.Tx) error)
 	return nil
 }
 
-func (db *DB) run(btx *bbolt.Tx, fn func(*Tx) error) error {
+// run runs fn and, when it, the change record and Options.CommitFault
+// succeed, adds the run's delivery to slot s.
+func (db *DB) run(ctx context.Context, btx *bbolt.Tx, s *commitSlot, fn func(*Tx) error) error {
 	tx := &Tx{db: db, read: &ReadTx{db: db, btx: btx}, seen: map[string]struct{}{}, markSeen: map[string]struct{}{}, phase: phaseRun}
 	defer func() { tx.phase = phaseDone }()
 	if err := fn(tx); err != nil {
@@ -106,24 +134,33 @@ func (db *DB) run(btx *bbolt.Tx, fn func(*Tx) error) error {
 	if tx.err != nil {
 		return tx.err
 	}
-	return tx.finish(btx)
+	change, err := tx.finish(btx)
+	if err != nil {
+		return err
+	}
+	if cf := db.opts.CommitFault; cf != nil {
+		if err := cf(ctx); err != nil {
+			return &faultError{err: err}
+		}
+	}
+	if change != nil || len(tx.after) > 0 {
+		s.items = append(s.items, slotItem{change: change, after: tx.after})
+	}
+	return nil
 }
 
 // finish reserves the next revision when the transaction recorded a subject
 // or mark, runs BeforeCommit, records the change and trims the log, all
-// before bbolt commits; it registers the change's delivery after commit.
-func (tx *Tx) finish(btx *bbolt.Tx) error {
-	after := tx.after
+// before bbolt commits. It returns nil for a transaction that reserves no
+// revision.
+func (tx *Tx) finish(btx *bbolt.Tx) (*Change, error) {
 	if len(tx.subjects) == 0 && len(tx.marks) == 0 {
-		if len(after) > 0 {
-			btx.OnCommit(func() { runAll(after) })
-		}
-		return nil
+		return nil, nil
 	}
 	lib := btx.Bucket([]byte(libBucket))
 	head, err := readHead(lib)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	rev := head + 1
 	subjects := tx.subjects
@@ -131,23 +168,23 @@ func (tx *Tx) finish(btx *bbolt.Tx) error {
 		tx.phase = phaseBeforeCommit
 		got, err := bc(tx, &Pending{Rev: rev, Touched: cloneSubjects(tx.subjects), Marks: slices.Clone(tx.marks)})
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if tx.err != nil {
-			return tx.err
+			return nil, tx.err
+		}
+		for _, s := range got {
+			if err := tx.db.schema.validSubject(s); err != nil {
+				return nil, err
+			}
 		}
 		subjects = cloneSubjects(got)
-		after = tx.after
 	}
 	change := Change{Rev: rev, Subjects: subjects, Marks: slices.Clone(tx.marks)}
 	if err := record(lib, change, tx.db.retention); err != nil {
-		return err
+		return nil, err
 	}
-	btx.OnCommit(func() {
-		tx.db.seq.publish(change)
-		runAll(after)
-	})
-	return nil
+	return &change, nil
 }
 
 func runAll(fns []func()) {
@@ -178,11 +215,16 @@ func (tx *Tx) Mark(m string) {
 }
 
 // Touch records s as a subject of this transaction's change without a write.
-// Inside BeforeCommit it fails the transaction.
+// s must start with a declared table prefix or SyntheticPrefix; another s,
+// or a Touch inside BeforeCommit, fails the transaction.
 func (tx *Tx) Touch(s Subject) {
 	tx.mustRun()
 	if tx.phase == phaseBeforeCommit {
 		_ = tx.fail(errors.New("bolttable: Touch inside BeforeCommit"))
+		return
+	}
+	if err := tx.db.schema.validSubject(s); err != nil {
+		_ = tx.fail(err)
 		return
 	}
 	tx.addSubject(Subject(slices.Clone([]byte(s))))
@@ -190,6 +232,8 @@ func (tx *Tx) Touch(s Subject) {
 
 // AfterCommit registers fn to run once after this transaction commits, never
 // after a rollback or a discarded Batch run; for signals about silent writes.
+// It runs after OnCommit and earlier AfterCommit functions, in commit order
+// across the DB (see Options.OnCommit).
 func (tx *Tx) AfterCommit(fn func()) {
 	tx.mustRun()
 	tx.after = append(tx.after, fn)

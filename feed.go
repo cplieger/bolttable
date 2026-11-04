@@ -4,57 +4,76 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"sync"
 
 	"go.etcd.io/bbolt"
 )
 
-// Since returns every retained change with Rev above after, in order. full
-// reports that the log cannot answer: a change after after has been trimmed
-// (after+1 is below the oldest retained revision), or after is above the
-// head; changes is then nil.
-func (r *ReadTx) Since(after uint64) ([]Change, bool, error) {
+// ChangePage is one page of the change log.
+type ChangePage struct {
+	// Changes are in revision order; empty, never nil, unless Full.
+	Changes []Change
+	// Full reports that the log cannot answer from after: a change after it
+	// has been trimmed (after+1 is below the oldest retained revision), or
+	// after is above the head. Changes is then nil and More false.
+	Full bool
+	// More reports that retained changes follow the last one returned.
+	More bool
+}
+
+// Since returns at most limit retained changes with Rev above after, in
+// order. limit below 1 is an error. To continue, call again with after set
+// to the last returned Rev; pages read in one transaction agree, and a later
+// transaction may find the log trimmed past after, which it reports as Full.
+func (r *ReadTx) Since(after uint64, limit int) (ChangePage, error) {
+	if limit < 1 {
+		return ChangePage{}, fmt.Errorf("bolttable: Since limit %d is below 1", limit)
+	}
 	if err := r.usable(); err != nil {
-		return nil, false, err
+		return ChangePage{}, err
 	}
 	lib, log, err := r.feed()
 	if err != nil {
-		return nil, false, err
+		return ChangePage{}, err
 	}
 	head, err := readHead(lib)
 	if err != nil {
-		return nil, false, err
+		return ChangePage{}, err
 	}
 	oldest, err := oldestRetained(log, head, r.db.retention)
 	if err != nil {
-		return nil, false, err
+		return ChangePage{}, err
 	}
 	if after > head || after+1 < oldest {
-		return nil, true, nil
+		return ChangePage{Full: true}, nil
 	}
-	changes := []Change{}
+	page := ChangePage{Changes: []Change{}}
 	c := log.Cursor()
 	for k, v := c.Seek(be64(after + 1)); k != nil; k, v = c.Next() {
+		if len(page.Changes) == limit {
+			page.More = true
+			break
+		}
 		ch, err := decodeChange(k, v)
 		if err != nil {
-			return nil, false, err
+			return ChangePage{}, err
 		}
-		changes = append(changes, ch)
+		page.Changes = append(page.Changes, ch)
 	}
-	return changes, false, nil
+	return page, nil
 }
 
-// Rev returns the head revision: the newest committed one, 0 before any.
-func (r *ReadTx) Rev() uint64 {
-	if r.usable() != nil {
-		return 0
+// Rev returns the head revision: the newest committed one, 0 before any. It
+// fails after the transaction ended, and with ErrCorrupt when the library
+// bucket, the change log or the head is damaged.
+func (r *ReadTx) Rev() (uint64, error) {
+	if err := r.usable(); err != nil {
+		return 0, err
 	}
 	lib, _, err := r.feed()
 	if err != nil {
-		return 0
+		return 0, err
 	}
-	head, _ := readHead(lib)
-	return head
+	return readHead(lib)
 }
 
 func (r *ReadTx) feed() (lib, log *bbolt.Bucket, err error) {
@@ -199,36 +218,4 @@ func (d *decoder) field() []byte {
 	f := bytes.Clone(d.b[:n])
 	d.b = d.b[n:]
 	return f
-}
-
-// sequencer delivers OnCommit in revision order: bbolt runs commit handlers
-// after releasing its writer lock, so two commits' handlers may run in
-// either order (https://github.com/etcd-io/bbolt/blob/v1.5.0/tx.go#L278).
-type sequencer struct {
-	on      func(Change)
-	pending map[uint64]Change
-	mu      sync.Mutex
-	next    uint64
-}
-
-func newSequencer(head uint64, on func(Change)) *sequencer {
-	return &sequencer{on: on, pending: map[uint64]Change{}, next: head + 1}
-}
-
-func (s *sequencer) publish(c Change) {
-	if s.on == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.pending[c.Rev] = c
-	for {
-		n, ok := s.pending[s.next]
-		if !ok {
-			return
-		}
-		delete(s.pending, s.next)
-		s.next++
-		s.on(n)
-	}
 }

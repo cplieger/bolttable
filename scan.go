@@ -6,8 +6,8 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-// cursorRange is a Range in stored-key bytes: keys starting with prefix,
-// from lo (inclusive) forward, or below hi (exclusive) in reverse.
+// cursorRange is a Range in stored-key bytes: keys starting with prefix, at
+// or above lo and below hi; a nil bound is none.
 type cursorRange struct {
 	prefix, lo, hi []byte
 	reverse        bool
@@ -19,7 +19,7 @@ type cursorRange struct {
 func scanBucket(b *bbolt.Bucket, cr *cursorRange, writable bool, visit func(k, v []byte) (bool, error)) error {
 	c := b.Cursor()
 	k, v := cr.first(c)
-	for k != nil && bytes.HasPrefix(k, cr.prefix) {
+	for k != nil && cr.contains(k) {
 		last := k
 		if writable {
 			last = bytes.Clone(k)
@@ -31,6 +31,12 @@ func scanBucket(b *bbolt.Bucket, cr *cursorRange, writable bool, visit func(k, v
 		k, v = cr.next(c, last, writable)
 	}
 	return nil
+}
+
+func (cr *cursorRange) contains(k []byte) bool {
+	return bytes.HasPrefix(k, cr.prefix) &&
+		(cr.lo == nil || bytes.Compare(k, cr.lo) >= 0) &&
+		(cr.hi == nil || bytes.Compare(k, cr.hi) < 0)
 }
 
 func (cr *cursorRange) first(c *bbolt.Cursor) (k, v []byte) {

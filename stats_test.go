@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	bbolterrors "go.etcd.io/bbolt/errors"
 )
 
 func stats(t *testing.T, db *DB) Stats {
@@ -92,13 +95,13 @@ func TestStatsCounts(t *testing.T) {
 	}
 	st := stats(t, db)
 	view(t, db, func(r *ReadTx) error {
-		if st.Rev != r.Rev() {
-			t.Errorf("Rev = %d, ReadTx.Rev = %d", st.Rev, r.Rev())
+		if rev, err := r.Rev(); st.Rev != rev || err != nil {
+			t.Errorf("Rev = %d, ReadTx.Rev = %d, %v", st.Rev, rev, err)
 		}
-		if _, full, _ := r.Since(st.Oldest - 1); full {
+		if page, _ := r.Since(st.Oldest-1, 100); page.Full {
 			t.Errorf("Since(Oldest-1 = %d) answered full", st.Oldest-1)
 		}
-		if _, full, _ := r.Since(st.Oldest - 2); !full {
+		if page, _ := r.Since(st.Oldest-2, 100); !page.Full {
 			t.Errorf("Since(Oldest-2 = %d) answered from a trimmed log", st.Oldest-2)
 		}
 		return nil
@@ -128,8 +131,8 @@ func TestStatsSizes(t *testing.T) {
 		return nil
 	})
 	st := stats(t, db)
-	if st.FreeBytes == 0 || st.FileBytes <= st.FreeBytes {
-		t.Errorf("FileBytes %d, FreeBytes %d after deleting 1,000 rows", st.FileBytes, st.FreeBytes)
+	if st.Space.FreeBytes == 0 || st.Space.FileBytes <= st.Space.FreeBytes {
+		t.Errorf("FileBytes %d, FreeBytes %d after deleting 1,000 rows", st.Space.FileBytes, st.Space.FreeBytes)
 	}
 	rows := map[string]int{}
 	for _, ns := range st.Namespaces {
@@ -149,5 +152,162 @@ func TestStatsSizes(t *testing.T) {
 	})
 	if rows["a.items"] != scanned || rows["a.items"] != 1000 || rows["b.other"] != 1 || rows["a.quiet"] != 0 {
 		t.Errorf("rows = %v, scanned %d", rows, scanned)
+	}
+}
+
+// fillAndThin writes 2,000 rows and deletes the first 1,000.
+func fillAndThin(t *testing.T, db *DB, f *fixture) {
+	t.Helper()
+	update(t, db, func(tx *Tx) error {
+		for i := range uint64(2000) {
+			if err := f.items.Put(tx, i, &item{Name: fmt.Sprintf("%0100d", i)}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	update(t, db, func(tx *Tx) error {
+		for i := range uint64(1000) {
+			if _, err := f.items.Delete(tx, i); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func TestSpaceMatchesStats(t *testing.T) {
+	f := newFixture(t)
+	db := mustOpen(t, tempPath(t), f.schema, Options{})
+	fillAndThin(t, db, f)
+	sp, err := db.Space()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := stats(t, db); st.Space != sp {
+		t.Errorf("Space() = %+v, Stats().Space = %+v", sp, st.Space)
+	}
+}
+
+func TestSpaceFreeAfterDeletes(t *testing.T) {
+	f := newFixture(t)
+	path := tempPath(t)
+	db := mustOpen(t, path, f.schema, Options{})
+	before, err := db.Space()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fillAndThin(t, db, f)
+	after, err := db.Space()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.FreeBytes <= before.FreeBytes || after.FileBytes != fi.Size() || after.FreeBytes%int64(os.Getpagesize()) != 0 {
+		t.Errorf("Space before %+v, after %+v, file %d bytes; want free bytes risen, in whole pages, and the file's size", before, after, fi.Size())
+	}
+}
+
+func TestSpaceNeedsNoTransaction(t *testing.T) {
+	f := newFixture(t)
+	db := mustOpen(t, tempPath(t), f.schema, Options{})
+	viewing, writing, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	done := make(chan error, 3)
+	go func() {
+		done <- db.View(t.Context(), func(*ReadTx) error { close(viewing); <-release; return nil })
+	}()
+	go func() {
+		done <- db.Update(t.Context(), func(*Tx) error { close(writing); <-release; return nil })
+	}()
+	wait(t, viewing, "the long View")
+	wait(t, writing, "the held write")
+	go func() { done <- db.Update(t.Context(), func(*Tx) error { return nil }) }()
+	within(t, 10*time.Second, "Space under a held View and write", func() error {
+		_, err := db.Space()
+		return err
+	})
+	close(release)
+	for range 3 {
+		within(t, 10*time.Second, "the held transactions", func() error { return <-done })
+	}
+}
+
+func TestSpaceStatFailure(t *testing.T) {
+	f := newFixture(t)
+	path := tempPath(t)
+	db := mustOpen(t, path, f.schema, Options{})
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if sp, err := db.Space(); err == nil || !strings.Contains(err.Error(), path) {
+		t.Errorf("Space of a removed file = %+v, %v; want a stat error naming the path", sp, err)
+	}
+}
+
+func TestSpaceAfterClose(t *testing.T) {
+	db, err := Open(tempPath(t), newFixture(t).schema, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if sp, err := db.Space(); !errors.Is(err, bbolterrors.ErrDatabaseNotOpen) {
+		t.Errorf("Space after Close = %+v, %v; want ErrDatabaseNotOpen", sp, err)
+	}
+}
+
+func TestSpaceRacesClose(t *testing.T) {
+	for range 20 {
+		db, err := Open(tempPath(t), newFixture(t).schema, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stop := make(chan struct{})
+		results := make(chan error, 1)
+		go func() {
+			for {
+				select {
+				case <-stop:
+					results <- nil
+					return
+				default:
+				}
+				if sp, err := db.Space(); err != nil && !errors.Is(err, bbolterrors.ErrDatabaseNotOpen) {
+					results <- fmt.Errorf("Space = %+v, %w", sp, err)
+					return
+				}
+			}
+		}()
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		close(stop)
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestSpacePastTheCloseCheck closes bbolt under a DB whose closed flag is
+// still clear: the state a Space call racing Close meets after its check.
+func TestSpacePastTheCloseCheck(t *testing.T) {
+	path := tempPath(t)
+	db, err := Open(path, newFixture(t).schema, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.bolt.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sp, err := db.Space(); err != nil || sp.FileBytes != fi.Size() {
+		t.Errorf("Space after bbolt closed = %+v, %v; want the file's size from the cached path", sp, err)
 	}
 }

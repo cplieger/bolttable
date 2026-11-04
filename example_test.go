@@ -1,11 +1,14 @@
 package bolttable_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
+	"time"
 
 	"github.com/cplieger/bolttable"
 )
@@ -40,7 +43,14 @@ func Example() {
 	defer func() { _ = os.RemoveAll(dir) }()
 	db, err := bolttable.Open(filepath.Join(dir, "app.bolt"), schema, bolttable.Options{
 		Retention: 1000,
-		OnCommit:  func(c bolttable.Change) { fmt.Println("revision", c.Rev, "subjects", len(c.Subjects)) },
+		LockWait:  5 * time.Second,
+		// A format change in a namespace the app can rebuild resets it,
+		// keeping two copies of the file; any other one fails Open.
+		Reset: bolttable.ResetPolicy{
+			Allow: func(n bolttable.NamespaceDigest) bool { return n.Name == "cache" },
+			Keep:  2,
+		},
+		OnCommit: func(c bolttable.Change) { fmt.Println("revision", c.Rev, "subjects", len(c.Subjects)) },
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -53,6 +63,7 @@ func Example() {
 		if err != nil {
 			return err
 		}
+		tx.Touch(bolttable.Synthetic([]byte("signups")))
 		return users.Put(tx, id, &user{Email: "ada@example.com", Admin: true})
 	})
 	if err != nil {
@@ -65,13 +76,25 @@ func Example() {
 			return err
 		}
 		n, err := admins.Value(r)
+		if err != nil {
+			return err
+		}
 		fmt.Println("user", id, "admins", n)
+		page, err := r.Since(0, 100)
+		for _, c := range page.Changes {
+			fmt.Printf("change %d: %d subjects, signups touched %v\n", c.Rev, len(c.Subjects), slices.ContainsFunc(c.Subjects, isSignups))
+		}
 		return err
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	// Output:
-	// revision 1 subjects 1
+	// revision 1 subjects 2
 	// user 1 admins 1
+	// change 1: 2 subjects, signups touched true
+}
+
+func isSignups(s bolttable.Subject) bool {
+	return bytes.Equal(s, bolttable.Synthetic([]byte("signups")))
 }

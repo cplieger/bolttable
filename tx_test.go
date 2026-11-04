@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -45,24 +46,13 @@ func TestOnCommitOrder(t *testing.T) {
 			wg.Wait()
 			assertOrdered(t, rec.all(), 16)
 			view(t, db, func(r *ReadTx) error {
-				changes, full, err := r.Since(0)
-				if err != nil || full || len(changes) != 16 {
-					t.Errorf("Since(0) = %d changes, %v, %v", len(changes), full, err)
+				page, err := r.Since(0, 100)
+				if err != nil || page.Full || page.More || len(page.Changes) != 16 {
+					t.Errorf("Since(0) = %d changes, %+v, %v", len(page.Changes), page, err)
 				}
 				return nil
 			})
 		})
-	}
-}
-
-func TestSequencerOrdersOutOfOrderHandlers(t *testing.T) {
-	var got []uint64
-	s := newSequencer(4, func(c Change) { got = append(got, c.Rev) })
-	for _, rev := range []uint64{7, 5, 6, 8} {
-		s.publish(Change{Rev: rev})
-	}
-	if !slices.Equal(got, []uint64{5, 6, 7, 8}) {
-		t.Errorf("delivered %v, want 5 to 8 in order", got)
 	}
 }
 
@@ -115,7 +105,7 @@ func TestBeforeCommitSeesPendingAndChoosesSubjects(t *testing.T) {
 			if err := f.quiet.Put(tx, 1, &item{Name: "derived"}); err != nil {
 				return nil, err
 			}
-			return []Subject{Subject("root")}, nil
+			return []Subject{Synthetic([]byte("root"))}, nil
 		},
 	})
 	update(t, db, func(tx *Tx) error {
@@ -126,7 +116,7 @@ func TestBeforeCommitSeesPendingAndChoosesSubjects(t *testing.T) {
 		t.Errorf("Pending = %+v", seen)
 	}
 	got := rec.all()
-	if len(got) != 1 || !slices.EqualFunc(got[0].Subjects, []Subject{Subject("root")}, slices.Equal) || !slices.Equal(got[0].Marks, []string{"m", "added"}) {
+	if len(got) != 1 || !slices.EqualFunc(got[0].Subjects, []Subject{Synthetic([]byte("root"))}, slices.Equal) || !slices.Equal(got[0].Marks, []string{"m", "added"}) {
 		t.Errorf("delivered %+v, want BeforeCommit's subjects and both marks", got)
 	}
 	view(t, db, func(r *ReadTx) error {
@@ -450,5 +440,281 @@ func TestBeforeCommitNextID(t *testing.T) {
 				t.Errorf("Update = %v, NextID = %d, %v, next %d; want ids 1 then 2", err, id, idErr, next)
 			}
 		})
+	}
+}
+
+func TestSyntheticSubjectReachesFeed(t *testing.T) {
+	f := newFixture(t)
+	var rec recorder
+	root := Synthetic([]byte("root"))
+	row := f.items.Subject(1)
+	db := mustOpen(t, tempPath(t), f.schema, Options{
+		OnCommit: rec.on, Retention: 10,
+		BeforeCommit: func(*Tx, *Pending) ([]Subject, error) { return []Subject{root, row}, nil },
+	})
+	update(t, db, func(tx *Tx) error { return f.items.Put(tx, 1, &item{Name: "x"}) })
+	want := []Subject{append(Subject{0xFF}, "root"...), row}
+	got := rec.all()
+	if len(got) != 1 || !slices.EqualFunc(got[0].Subjects, want, slices.Equal) {
+		t.Errorf("OnCommit saw %+v, want subjects %q", got, want)
+	}
+	view(t, db, func(r *ReadTx) error {
+		page, err := r.Since(0, 10)
+		if err != nil || len(page.Changes) != 1 || !slices.EqualFunc(page.Changes[0].Subjects, want, slices.Equal) {
+			t.Errorf("Since = %+v, %v; want subjects %q", page, err, want)
+		}
+		return nil
+	})
+}
+
+func TestTouchRejectsUndeclaredPrefix(t *testing.T) {
+	for name, s := range map[string]Subject{"undeclared prefix": {0x55, 1, 2}, "empty": {}} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			db := mustOpen(t, tempPath(t), f.schema, Options{Retention: 10})
+			err := db.Update(t.Context(), func(tx *Tx) error {
+				tx.Touch(s)
+				return f.items.Put(tx, 1, &item{Name: "x"})
+			})
+			if err == nil || !strings.Contains(err.Error(), "subject") {
+				t.Fatalf("Update = %v, want a subject refusal", err)
+			}
+			if rev := headRev(t, db); rev != 0 {
+				t.Errorf("rev = %d, want 0", rev)
+			}
+			view(t, db, func(r *ReadTx) error {
+				if _, found, _ := f.items.Get(r, 1); found {
+					t.Error("the refused transaction's row was stored")
+				}
+				return nil
+			})
+		})
+	}
+}
+
+func TestBeforeCommitRejectsUndeclaredSubject(t *testing.T) {
+	for name, s := range map[string]Subject{"undeclared prefix": {0x55, 1}, "empty": {}} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			var rec recorder
+			db := mustOpen(t, tempPath(t), f.schema, Options{
+				OnCommit: rec.on, Retention: 10,
+				BeforeCommit: func(*Tx, *Pending) ([]Subject, error) { return []Subject{f.items.Subject(1), s}, nil },
+			})
+			err := db.Update(t.Context(), func(tx *Tx) error { return f.items.Put(tx, 1, &item{Name: "x"}) })
+			if err == nil || !strings.Contains(err.Error(), "subject") {
+				t.Fatalf("Update = %v, want a subject refusal", err)
+			}
+			if rev := headRev(t, db); rev != 0 || len(rec.all()) != 0 {
+				t.Errorf("rev = %d with %d deliveries, want nothing committed", rev, len(rec.all()))
+			}
+		})
+	}
+}
+
+func TestSyntheticCopiesKey(t *testing.T) {
+	key := append(make([]byte, 0, 16), "root"...)
+	s := Synthetic(key)
+	key[0] = 'X'
+	_ = append(key, "tail"...)
+	if string(s) != "\xffroot" {
+		t.Errorf("Synthetic after its input changed = %q, want 0xFF root", s)
+	}
+}
+
+func TestBatchGroupsAtMaxSize(t *testing.T) {
+	f := newFixture(t)
+	db := mustOpen(t, tempPath(t), f.schema, Options{MaxBatchSize: 4, MaxBatchDelay: time.Hour})
+	before := stats(t, db).Commits
+	within(t, 10*time.Second, "four Batch calls", func() error {
+		return errors.Join(batch4(t.Context(), db, func(i int, tx *Tx) error { return f.items.Put(tx, uint64(i+1), &item{}) })...)
+	})
+	if got := stats(t, db).Commits - before; got != 1 {
+		t.Errorf("four calls made %d commits, want one group", got)
+	}
+}
+
+type faultKey struct{}
+
+// faultCtx marks a context for the test's CommitFault hook.
+func faultCtx(ctx context.Context) context.Context { return context.WithValue(ctx, faultKey{}, true) }
+
+// faultHook fails every commit whose context faultCtx marked, with
+// syscall.ENOSPC, and counts each time it is asked.
+type faultHook struct {
+	asked, selected atomic.Int32
+}
+
+func (h *faultHook) fault(ctx context.Context) error {
+	h.asked.Add(1)
+	if ctx.Value(faultKey{}) != nil {
+		h.selected.Add(1)
+		return syscall.ENOSPC
+	}
+	return nil
+}
+
+func TestCommitFaultWrapsErrCommit(t *testing.T) {
+	f := newFixture(t)
+	var rec recorder
+	var h faultHook
+	db := mustOpen(t, tempPath(t), f.schema, Options{OnCommit: rec.on, Retention: 10, CommitFault: h.fault})
+	before := stats(t, db).Commits
+	ran := false
+	err := db.Update(faultCtx(t.Context()), func(tx *Tx) error {
+		tx.AfterCommit(func() { ran = true })
+		return f.items.Put(tx, 1, &item{Name: "x"})
+	})
+	if !errors.Is(err, ErrCommit) || !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("Update = %v, want ErrCommit and ENOSPC", err)
+	}
+	if rev := headRev(t, db); rev != 0 || len(rec.all()) != 0 || ran {
+		t.Errorf("a faulted commit left rev %d, %d deliveries, AfterCommit ran %v", rev, len(rec.all()), ran)
+	}
+	if got := stats(t, db).Commits; got != before {
+		t.Errorf("Commits = %d, want %d", got, before)
+	}
+	view(t, db, func(r *ReadTx) error {
+		if _, found, _ := f.items.Get(r, 1); found {
+			t.Error("the faulted row was stored")
+		}
+		return nil
+	})
+}
+
+func TestCommitFaultRollsBackBeforeCommitWrites(t *testing.T) {
+	f := newFixture(t)
+	var h faultHook
+	db := mustOpen(t, tempPath(t), f.schema, Options{
+		Retention: 10, CommitFault: h.fault,
+		BeforeCommit: func(tx *Tx, p *Pending) ([]Subject, error) {
+			return p.Touched, f.quiet.Put(tx, 7, &item{Name: "derived"})
+		},
+	})
+	err := db.Update(faultCtx(t.Context()), func(tx *Tx) error { return f.items.Put(tx, 1, &item{}) })
+	if !errors.Is(err, ErrCommit) {
+		t.Fatalf("Update = %v, want ErrCommit", err)
+	}
+	view(t, db, func(r *ReadTx) error {
+		if _, found, _ := f.quiet.Get(r, 7); found {
+			t.Error("BeforeCommit's silent write survived the fault")
+		}
+		return nil
+	})
+}
+
+func TestCommitFaultSilentAndEmpty(t *testing.T) {
+	f := newFixture(t)
+	var h faultHook
+	db := mustOpen(t, tempPath(t), f.schema, Options{CommitFault: h.fault})
+	calls := map[string]func(*Tx) error{
+		"silent": func(tx *Tx) error { return f.quiet.Put(tx, 1, &item{}) },
+		"empty":  func(*Tx) error { return nil },
+	}
+	for name, fn := range calls {
+		h.selected.Store(0)
+		if err := db.Update(faultCtx(t.Context()), fn); !errors.Is(err, ErrCommit) || h.selected.Load() != 1 {
+			t.Errorf("%s: Update = %v, hook selected %d times; want ErrCommit after one ask", name, err, h.selected.Load())
+		}
+	}
+	view(t, db, func(r *ReadTx) error {
+		if _, found, _ := f.quiet.Get(r, 1); found {
+			t.Error("the faulted silent write was stored")
+		}
+		return nil
+	})
+}
+
+func TestCommitFaultSelectsByContext(t *testing.T) {
+	f := newFixture(t)
+	var h faultHook
+	db := mustOpen(t, tempPath(t), f.schema, Options{Retention: 10, CommitFault: h.fault})
+	ran := false
+	err := db.Update(t.Context(), func(tx *Tx) error {
+		tx.AfterCommit(func() { ran = true })
+		return f.items.Put(tx, 1, &item{})
+	})
+	if err != nil || !ran || h.asked.Load() != 1 || headRev(t, db) != 1 {
+		t.Errorf("an unselected Update = %v, AfterCommit %v, asked %d, rev %d; want a commit after one ask", err, ran, h.asked.Load(), headRev(t, db))
+	}
+}
+
+func TestCommitFaultBatchRerun(t *testing.T) {
+	f := newFixture(t)
+	var h faultHook
+	var log events
+	db := mustOpen(t, tempPath(t), f.schema, Options{Retention: 10, CommitFault: h.fault, MaxBatchSize: 4, MaxBatchDelay: time.Hour})
+	errs := make([]error, 4)
+	within(t, 10*time.Second, "the group", func() error {
+		var wg sync.WaitGroup
+		for i := range 4 {
+			ctx := t.Context()
+			if i == 2 {
+				ctx = faultCtx(ctx)
+			}
+			wg.Go(func() {
+				errs[i] = db.Batch(ctx, func(tx *Tx) error {
+					name := fmt.Sprint(i)
+					tx.AfterCommit(func() { log.add(name) })
+					return f.items.Put(tx, uint64(i+1), &item{})
+				})
+			})
+		}
+		wg.Wait()
+		return nil
+	})
+	if !errors.Is(errs[2], ErrCommit) || !errors.Is(errs[2], syscall.ENOSPC) {
+		t.Errorf("the selected call = %v, want ErrCommit and ENOSPC", errs[2])
+	}
+	if errs[0] != nil || errs[1] != nil || errs[3] != nil {
+		t.Errorf("unselected calls = %v", errs)
+	}
+	if n := h.selected.Load(); n < 2 {
+		t.Errorf("the hook selected the call %d times, want at least 2: the group run and the solo rerun", n)
+	}
+	got := log.all()
+	slices.Sort(got)
+	if fmt.Sprint(got) != "[0 1 3]" {
+		t.Errorf("callbacks = %v, want those of calls 0, 1 and 3", got)
+	}
+	view(t, db, func(r *ReadTx) error {
+		for i, want := range []bool{true, true, false, true} {
+			if _, found, _ := f.items.Get(r, uint64(i+1)); found != want {
+				t.Errorf("row %d stored = %v, want %v", i+1, found, want)
+			}
+		}
+		return nil
+	})
+}
+
+func TestCommitFaultNotAskedByVerify(t *testing.T) {
+	f := newFixture(t)
+	var h faultHook
+	db := mustOpen(t, tempPath(t), f.schema, Options{
+		CommitFault: func(context.Context) error {
+			h.asked.Add(1)
+			return syscall.ENOSPC
+		},
+	})
+	if _, err := db.Verify(faultCtx(t.Context()), true); err != nil || h.asked.Load() != 0 {
+		t.Errorf("Verify repair = %v with the hook asked %d times, want nil and none", err, h.asked.Load())
+	}
+}
+
+func TestCommitFaultAskedAfterBeforeCommit(t *testing.T) {
+	f := newFixture(t)
+	var h faultHook
+	refused := errors.New("refused")
+	db := mustOpen(t, tempPath(t), f.schema, Options{
+		Retention: 10, CommitFault: h.fault,
+		BeforeCommit: func(*Tx, *Pending) ([]Subject, error) { return nil, refused },
+	})
+	err := db.Update(faultCtx(t.Context()), func(tx *Tx) error { return f.items.Put(tx, 1, &item{}) })
+	if err != refused || h.asked.Load() != 0 {
+		t.Errorf("Update = %v with the hook asked %d times; want BeforeCommit's error as is and no ask", err, h.asked.Load())
+	}
+	fnErr := errors.New("fn")
+	if err := db.Update(faultCtx(t.Context()), func(*Tx) error { return fnErr }); err != fnErr || h.asked.Load() != 0 {
+		t.Errorf("Update = %v with the hook asked %d times; want fn's error as is and no ask", err, h.asked.Load())
 	}
 }

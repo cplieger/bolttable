@@ -133,7 +133,9 @@ type DB struct {
 	closed    atomic.Bool
 }
 
-func start(bdb *bbolt.DB, s *Schema, o *Options, want map[string][32]byte) (*DB, error) {
+// start inspects and completes the file bdb opened and starts the DB over
+// it, leaving in *wtx the write transaction it began, for closeBolt.
+func start(bdb *bbolt.DB, s *Schema, o *Options, want map[string][32]byte, wtx **bbolt.Tx) (*DB, error) {
 	hook("start")
 	var plan openPlan
 	if err := bdb.View(func(btx *bbolt.Tx) error {
@@ -147,7 +149,7 @@ func start(bdb *bbolt.DB, s *Schema, o *Options, want map[string][32]byte) (*DB,
 		return nil, err
 	}
 	if plan.lib || len(plan.ensure) > 0 {
-		if err := bdb.Update(func(btx *bbolt.Tx) error { return plan.apply(btx, want) }); err != nil {
+		if err := createNamespaces(bdb, &plan, want, wtx); err != nil {
 			return nil, fmt.Errorf("bolttable: create namespaces: %w", err)
 		}
 	}
@@ -163,6 +165,26 @@ func start(bdb *bbolt.DB, s *Schema, o *Options, want map[string][32]byte) (*DB,
 	// crypto/rand.Read never returns an error (Go 1.24+).
 	_, _ = rand.Read(db.epoch[:])
 	return db, nil
+}
+
+// createNamespaces applies plan in one write transaction, left in *wtx. It
+// is unmanaged, as the reset's is, because bbolt refuses Rollback on a
+// managed Update transaction that a panicking rollback left open.
+func createNamespaces(bdb *bbolt.DB, plan *openPlan, want map[string][32]byte, wtx **bbolt.Tx) error {
+	btx, err := bdb.Begin(true)
+	if err != nil {
+		return err
+	}
+	*wtx = btx
+	defer func() {
+		hook("start-rollback")
+		_ = btx.Rollback()
+	}()
+	if err := plan.apply(btx, want); err != nil {
+		return err
+	}
+	hook("start-commit")
+	return btx.Commit()
 }
 
 func retentionOf(n int) (uint64, error) {

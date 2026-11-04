@@ -329,7 +329,7 @@ func TestOpenReadOnlyCorruptFile(t *testing.T) {
 	t.Run("corrupt freelist page", func(t *testing.T) {
 		path := storedFile(t)
 		setPageFlags(t, path, readMeta(t, path).freelist, 0x02)
-		assertReadOnlyInvalid(t, path, "panicked")
+		assertReadOnlyInvalid(t, path, "freelist")
 	})
 }
 

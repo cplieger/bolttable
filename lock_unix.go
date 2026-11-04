@@ -28,3 +28,7 @@ func unlockFile(f *os.File) error {
 }
 
 func lockSupported() error { return nil }
+
+// unlockBolt releases bbolt's flock on its data file f
+// (https://github.com/etcd-io/bbolt/blob/v1.5.0/bolt_unix.go#L50).
+func unlockBolt(f *os.File) error { return unlockFile(f) }

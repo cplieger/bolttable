@@ -27,15 +27,8 @@ func resetFile(path string, s *Schema, want map[string][32]byte, names []string,
 	}
 	var btx *bbolt.Tx
 	defer func() {
-		// A Rollback that panicked leaves the transaction open, and bbolt's
-		// Close would wait for it forever; closing the descriptor releases
-		// bbolt's flock and leaves the mapping to the process.
-		if btx != nil && btx.DB() != nil {
-			_ = f.Close()
-			return
-		}
-		if cerr := bdb.Close(); err == nil && cerr != nil {
-			err = fmt.Errorf("bolttable: close %s: %w", path, cerr)
+		if cerr := closeBolt(path, bdb, f, btx); err == nil {
+			err = cerr
 		}
 	}()
 	return guardFault(path, stepReset, op, func() error {

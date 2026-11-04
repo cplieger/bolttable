@@ -61,18 +61,6 @@ func OpenReadOnly(path string, s *Schema, o ReadOptions) (rdb *ReadDB, err error
 	if size == 0 {
 		return nil, fmt.Errorf("bolttable: open %s: holds no database: %w", path, fs.ErrNotExist)
 	}
-	want := s.digests()
-	err = readOnly(path, stepReadInspect, false, func(bdb *bbolt.DB) error {
-		return bdb.View(func(btx *bbolt.Tx) error {
-			if serr := checkSize(btx, path, stepReadInspect, size); serr != nil {
-				return serr
-			}
-			return inspectReadOnly(btx, s, want)
-		})
-	})
-	if err != nil {
-		return nil, err
-	}
 	db, err := openReader(path, s)
 	if err != nil {
 		return nil, err
@@ -81,8 +69,9 @@ func OpenReadOnly(path string, s *Schema, o ReadOptions) (rdb *ReadDB, err error
 	return &ReadDB{db: db}, nil
 }
 
-// openReader opens the ReadDB's own handle. PreLoadFreelist makes bbolt
-// read the freelist, without which a read-only handle reports no free pages
+// openReader opens the ReadDB's own handle, refusing inside guardRead a
+// file inspectReadOnly refuses. PreLoadFreelist makes bbolt read the
+// freelist, without which a read-only handle reports no free pages
 // (https://github.com/etcd-io/bbolt/blob/v1.5.0/db.go#L303).
 func openReader(path string, s *Schema) (*DB, error) {
 	o := boltOptions(true)
@@ -92,12 +81,15 @@ func openReader(path string, s *Schema) (*DB, error) {
 		return nil, err
 	}
 	db := &DB{bolt: bdb, schema: s, path: bdb.Path(), pageSize: bdb.Info().PageSize}
-	if err := bdb.View(func(btx *bbolt.Tx) error {
-		db.baseTxID = txID(btx)
-		return nil
+	want := s.digests()
+	if err := guardRead(path, stepReadOpen, func() error {
+		return bdb.View(func(btx *bbolt.Tx) error {
+			db.baseTxID = txID(btx)
+			return inspectReadOnly(btx, s, want)
+		})
 	}); err != nil {
 		_ = bdb.Close()
-		return nil, fmt.Errorf("bolttable: open %s: %w", path, err)
+		return nil, err
 	}
 	// crypto/rand.Read never returns an error (Go 1.24+).
 	_, _ = rand.Read(db.epoch[:])

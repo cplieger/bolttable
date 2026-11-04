@@ -228,8 +228,8 @@ func TestOpenReusesInspectionMeasure(t *testing.T) {
 	if db.OpenReport().Compacted {
 		t.Fatal("fixture: the policy compacted")
 	}
-	if readOnly != 2 {
-		t.Errorf("%d read-only opens, want the inspection's two", readOnly)
+	if readOnly != 1 {
+		t.Errorf("%d read-only opens, want the inspection's one", readOnly)
 	}
 }
 

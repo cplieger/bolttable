@@ -169,6 +169,7 @@ func assertUnlocked(t *testing.T, path string) {
 	t.Helper()
 	assertDataUnlocked(t, path)
 	assertLockFree(t, path)
+	assertUnmapped(t, path)
 }
 
 // assertLockFree fails the test when a handle still holds path's lock file.
@@ -234,7 +235,7 @@ func TestOpenClassifiesInvalidFile(t *testing.T) {
 			setPageFlags(t, path, readMeta(t, path).root, 0xFFFF)
 			return path
 		}},
-		{name: "corrupt freelist page", panicText: "invalid freelist page", build: func(t *testing.T) string {
+		{name: "corrupt freelist page", panicText: "invalid freelist page", wantText: "freelist", build: func(t *testing.T) string {
 			path := storedFile(t)
 			setPageFlags(t, path, readMeta(t, path).freelist, 0x02)
 			return path
@@ -574,6 +575,131 @@ func TestRollbackPanicDoesNotHang(t *testing.T) {
 			assertResetInvalid(t, storedFile(t), policy)
 		})
 	}
+}
+
+// A rollback that panics again when retried leaves bbolt's Close nothing
+// it can wait for, so the lock must still be released.
+func TestRetriedRollbackPanicReleasesLock(t *testing.T) {
+	path := storedFile(t)
+	before := readFile(t, path)
+	panicAt(t, map[string]any{"reset-commit": testPanic("commit"), "reset-rollback": testPanic("rollback"), "rollback-retry": testPanic("retry")})
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	db, err := Open(path, mismatchSchema(), Options{Reset: allowAll})
+	if err == nil {
+		_ = db.Close()
+		t.Fatal("Open succeeded")
+	}
+	if !errors.Is(err, ErrInvalidFile) || !strings.Contains(err.Error(), "step 7") {
+		t.Errorf("Open = %v, want ErrInvalidFile naming step 7", err)
+	}
+	if !bytes.Equal(before, readFile(t, path)) {
+		t.Error("the file changed")
+	}
+	assertDataUnlocked(t, path)
+	assertLockFree(t, path)
+	stepHook = nil
+	mustOpen(t, path, mismatchSchema(), Options{Reset: allowAll})
+}
+
+// A panic in the deferred Rollback of start's namespace creation leaves its
+// write transaction open, which bbolt's Close would wait for forever. A
+// retry that succeeds closes the file; one that panics again releases it.
+func TestStartRollbackPanicReleasesFile(t *testing.T) {
+	released := func(t *testing.T, path string) {
+		t.Helper()
+		assertDataUnlocked(t, path)
+		assertLockFree(t, path)
+	}
+	for name, c := range map[string]struct {
+		at    map[string]any
+		check func(*testing.T, string)
+	}{
+		"retry succeeds": {map[string]any{"start-commit": testPanic("commit"), "start-rollback": testPanic("rollback")}, assertUnlocked},
+		"retry panics":   {map[string]any{"start-commit": testPanic("commit"), "start-rollback": testPanic("rollback"), "rollback-retry": testPanic("retry")}, released},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := storedFile(t)
+			before := readFile(t, path)
+			panicAt(t, c.at)
+			defer debug.SetGCPercent(debug.SetGCPercent(-1))
+			v := openPanic(t, path, withNamespaceC(newFixture(t)), Options{})
+			if v != testPanic("rollback") {
+				t.Errorf("recovered %v (%T), want the rollback's panic", v, v)
+			}
+			if !bytes.Equal(before, readFile(t, path)) {
+				t.Error("the file changed")
+			}
+			c.check(t, path)
+			stepHook = nil
+			mustOpen(t, path, withNamespaceC(newFixture(t)), Options{})
+		})
+	}
+}
+
+// A panic bbolt raises inside its open, after it mapped and locked the
+// file, returns no handle to close; the lock must be released anyway.
+func TestPanicInBoltOpenReleasesLock(t *testing.T) {
+	path := storedFile(t)
+	boltOpen = func(p string, mode os.FileMode, o *bbolt.Options) (*bbolt.DB, error) {
+		bdb, err := bbolt.Open(p, mode, o)
+		if err == nil {
+			t.Cleanup(func() { _ = bdb.Close() })
+		}
+		panic(testPanic("inside bbolt's open"))
+	}
+	t.Cleanup(func() { boltOpen = bbolt.Open })
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	db, err := Open(path, newFixture(t).schema, Options{})
+	if err == nil {
+		_ = db.Close()
+		t.Fatal("Open succeeded")
+	}
+	if !errors.Is(err, ErrInvalidFile) {
+		t.Errorf("Open = %v, want ErrInvalidFile", err)
+	}
+	assertDataUnlocked(t, path)
+	assertLockFree(t, path)
+	boltOpen = bbolt.Open
+	mustOpen(t, path, newFixture(t).schema, Options{})
+}
+
+// A file whose Open failed on a corrupt freelist opens again in the same
+// process once its bytes are repaired.
+func TestFailedOpenFileReopens(t *testing.T) {
+	path := storedFile(t)
+	good := readFile(t, path)
+	setPageFlags(t, path, readMeta(t, path).freelist, 0x02)
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	f := newFixture(t)
+	if db, err := Open(path, f.schema, Options{}); !errors.Is(err, ErrInvalidFile) {
+		if err == nil {
+			_ = db.Close()
+		}
+		t.Fatalf("Open = %v, want ErrInvalidFile", err)
+	}
+	if rdb, err := OpenReadOnly(path, f.schema, ReadOptions{}); !errors.Is(err, ErrInvalidFile) {
+		if err == nil {
+			_ = rdb.Close()
+		}
+		t.Fatalf("OpenReadOnly = %v, want ErrInvalidFile", err)
+	}
+	if err := os.WriteFile(path, good, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rdb, err := OpenReadOnly(path, f.schema, ReadOptions{})
+	if err != nil {
+		t.Fatalf("OpenReadOnly of the repaired file: %v", err)
+	}
+	if err := rdb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db := mustOpen(t, path, f.schema, Options{})
+	view(t, db, func(r *ReadTx) error {
+		if v, found, err := f.items.Get(r, 1); err != nil || !found || v.Name != "a" {
+			t.Errorf("Get after reopen = %+v, %v, %v", v, found, err)
+		}
+		return nil
+	})
 }
 
 func TestOpenMovesAsideOnce(t *testing.T) {

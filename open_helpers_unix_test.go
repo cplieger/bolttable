@@ -3,7 +3,10 @@
 package bolttable
 
 import (
+	"errors"
+	"io/fs"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -24,4 +27,23 @@ func assertDataUnlocked(t *testing.T, path string) {
 		return
 	}
 	_ = syscall.Flock(fd, syscall.LOCK_UN)
+}
+
+// assertUnmapped fails the test when this process still maps the file at
+// path, read where /proc/self/maps exists: a mapping keeps bbolt's flock on
+// Linux after its descriptor closes.
+func assertUnmapped(t *testing.T, path string) {
+	t.Helper()
+	maps, err := os.ReadFile("/proc/self/maps")
+	if errors.Is(err, fs.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	for line := range strings.Lines(string(maps)) {
+		if strings.HasSuffix(strings.TrimSpace(line), " "+path) {
+			t.Errorf("%s is still mapped: %s", path, strings.TrimSpace(line))
+		}
+	}
 }

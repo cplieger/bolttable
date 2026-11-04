@@ -33,11 +33,13 @@ var (
 	// holds the file.
 	ErrLocked = errors.New("bolttable: database file is locked")
 	// ErrInvalidFile reports a file bbolt cannot read as a database: both
-	// meta pages rejected, fewer bytes than its meta records, or a page read
-	// that faulted or panicked. bbolt's "file size too small" stays
-	// unclassified. A panic inside bbolt's own open leaves that handle's
-	// mapping reserved until the process exits, and a file another program
-	// wrote with NoFreelistSync is walked on a goroutine no guard reaches.
+	// meta pages rejected, a page size too small to hold a meta page, fewer
+	// bytes than its meta records, a freelist page bbolt cannot load or that
+	// lists a page it must never reuse, or a page read that faulted or
+	// panicked; bbolt's "file size too small" stays unclassified. A panic
+	// inside bbolt's open, or a rollback that panics twice, leaves the file
+	// mapped but not locked, and bbolt walks a NoFreelistSync file on an
+	// unguarded goroutine.
 	ErrInvalidFile = errors.New("bolttable: invalid database file")
 )
 

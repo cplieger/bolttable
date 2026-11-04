@@ -23,3 +23,6 @@ func assertDataUnlocked(t *testing.T, path string) {
 		_ = bdb.Close()
 	}
 }
+
+// assertUnmapped is a no-op where this process's mappings cannot be listed.
+func assertUnmapped(*testing.T, string) {}

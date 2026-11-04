@@ -12,7 +12,8 @@ import (
 )
 
 // Test seams: boltOpen is every bbolt open the package makes, and stepHook,
-// nil outside tests, is called at named points of the reset and of start.
+// nil outside tests, is called at named points of the reset, of start and of
+// closeBolt's rollback retry.
 var (
 	boltOpen = bbolt.Open
 	stepHook func(step string)
@@ -31,8 +32,7 @@ const (
 	stepCompact = "step 8 (compact)"
 	stepOpen    = "step 9 (open)"
 
-	stepReadInspect = "read-only open (inspect)"
-	stepReadOpen    = "read-only open"
+	stepReadOpen = "read-only open"
 )
 
 // faultOp marks, for guardFault, a call into bbolt that walks pages the
@@ -98,10 +98,13 @@ func invalidPage(path, step string, v any) error {
 	return fmt.Errorf("%w: %s: %s: %s", ErrInvalidFile, path, step, what)
 }
 
-// openBolt opens path through bbolt inside guardRead and classifies its
-// error. It records the *os.File bbolt opens and closes it after a panic,
-// since bbolt then returned no handle to close; that releases bbolt's flock.
+// openBolt opens path through bbolt inside guardRead, after checkPages, and
+// classifies its error. It records the *os.File bbolt opens and releases it
+// after a panic, since bbolt then returned no handle to close.
 func openBolt(path, step string, o *bbolt.Options) (*bbolt.DB, *os.File, error) {
+	if err := checkPages(path, step); err != nil {
+		return nil, nil, err
+	}
 	var f *os.File
 	o.OpenFile = func(name string, flag int, perm os.FileMode) (*os.File, error) {
 		var err error
@@ -118,9 +121,45 @@ func openBolt(path, step string, o *bbolt.Options) (*bbolt.DB, *os.File, error) 
 		return bdb, f, nil
 	}
 	if f != nil {
-		_ = f.Close()
+		releaseFile(f)
 	}
 	return nil, nil, classify(path, step, err)
+}
+
+// releaseFile releases bbolt's lock on f and closes f, for a handle bbolt
+// cannot close. The lock goes first: on Linux bbolt's mapping keeps f's open
+// file description, and with it the flock, alive after f closes. The
+// mapping itself stays, since bbolt exposes no way to unmap it.
+func releaseFile(f *os.File) {
+	_ = unlockBolt(f)
+	_ = f.Close()
+}
+
+// closeBolt closes bdb, which f backs. tx is bdb's last write transaction,
+// nil when it had none: one a panic left open makes bbolt's Close wait for
+// it forever, so closeBolt rolls it back once more, and releases f instead
+// when it stays open.
+func closeBolt(path string, bdb *bbolt.DB, f *os.File, tx *bbolt.Tx) error {
+	if tx != nil && tx.DB() != nil {
+		retryRollback(tx)
+		if tx.DB() != nil {
+			releaseFile(f)
+			return nil
+		}
+	}
+	if err := bdb.Close(); err != nil {
+		return fmt.Errorf("bolttable: close %s: %w", path, err)
+	}
+	return nil
+}
+
+// retryRollback rolls tx back, dropping any panic: a rollback that panics
+// again leaves tx open, which closeBolt checks.
+func retryRollback(tx *bbolt.Tx) {
+	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
+	defer func() { _ = recover() }()
+	hook("rollback-retry")
+	_ = tx.Rollback()
 }
 
 // classify maps an error of a bbolt open: a meta bbolt rejects is an invalid

@@ -228,19 +228,13 @@ func (p *opening) prepare(size int64) error {
 	return p.invalid(err)
 }
 
-// inspect compares the stored file with the schema through two read-only
-// handles, writing nothing. The first reads only the meta pages at open, so
-// its size check runs before any page past a truncation is touched, where a
-// read would raise SIGBUS. The second loads the freelist page the read-write
-// open will read. One closes before the next opens: bbolt's flock is per
-// open file description.
+// inspect compares the stored file with the schema through a read-only
+// handle, writing nothing, and measures its free pages.
 func (p *opening) inspect(size int64) (*FormatError, error) {
 	var fe *FormatError
-	err := readOnly(p.path, stepInspect, false, func(bdb *bbolt.DB) error {
+	err := readOnly(p.path, stepInspect, func(bdb *bbolt.DB) error {
+		p.measure = &freeMeasure{size: size, free: freeBytes(new(bdb.Stats()), bdb.Info().PageSize)}
 		return bdb.View(func(btx *bbolt.Tx) error {
-			if err := checkSize(btx, p.path, stepInspect, size); err != nil {
-				return err
-			}
 			p.stored = map[string][32]byte{}
 			if err := btx.ForEach(func(name []byte, b *bbolt.Bucket) error {
 				p.stored[string(name)] = storedDigest(b)
@@ -256,26 +250,14 @@ func (p *opening) inspect(size int64) (*FormatError, error) {
 	if err != nil {
 		return nil, err
 	}
-	return fe, readOnly(p.path, stepInspect, true, func(bdb *bbolt.DB) error {
-		p.measure = &freeMeasure{size: size, free: freeBytes(new(bdb.Stats()), bdb.Info().PageSize)}
-		return nil
-	})
-}
-
-// checkSize must run in a handle's first View, before any page past the
-// meta pages is read: on a truncated file that read raises SIGBUS.
-func checkSize(btx *bbolt.Tx, path, step string, size int64) error {
-	if n := btx.Size(); n > size {
-		return fmt.Errorf("%w: %s: %s: truncated: meta records %d bytes, file holds %d", ErrInvalidFile, path, step, n, size)
-	}
-	return nil
+	return fe, nil
 }
 
 // readOnly runs fn over a read-only handle on path inside guardRead, then
-// closes the handle.
-func readOnly(path, step string, preload bool, fn func(*bbolt.DB) error) error {
+// closes the handle. openReader owns why the handle loads the freelist.
+func readOnly(path, step string, fn func(*bbolt.DB) error) error {
 	o := boltOptions(true)
-	o.PreLoadFreelist = preload
+	o.PreLoadFreelist = true
 	bdb, _, err := openBolt(path, step, o)
 	if err != nil {
 		return err
@@ -408,18 +390,19 @@ func (p *opening) invalid(err error) error {
 
 // openReadWrite opens the file for writing and starts the DB over it.
 func (p *opening) openReadWrite() (db *DB, err error) {
-	bdb, _, err := openBolt(p.path, stepOpen, boltOptions(false))
+	bdb, f, err := openBolt(p.path, stepOpen, boltOptions(false))
 	if err != nil {
 		return nil, err
 	}
+	var wtx *bbolt.Tx
 	defer func() {
 		if db == nil {
-			_ = bdb.Close()
+			_ = closeBolt(p.path, bdb, f, wtx)
 		}
 	}()
 	err = guardFault(p.path, stepOpen, &p.op, func() error {
 		var serr error
-		db, serr = start(bdb, p.schema, &p.opts, p.want)
+		db, serr = start(bdb, p.schema, &p.opts, p.want, &wtx)
 		return serr
 	})
 	if err != nil {

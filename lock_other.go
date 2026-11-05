@@ -1,4 +1,4 @@
-//go:build !(linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows)
+//go:build !(linux || darwin || dragonfly || freebsd || netbsd || openbsd)
 
 package bolttable
 

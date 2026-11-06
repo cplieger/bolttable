@@ -38,11 +38,16 @@ type Stats struct {
 	Space      Space
 }
 
-// Space is the file's size and the bytes of it bbolt can reuse; in-use bytes
-// are FileBytes - FreeBytes.
+// Space is the file's size, the bytes its data uses and the bytes bbolt can
+// reuse. InUseBytes + FreeBytes is at most FileBytes; the rest is bbolt's
+// preallocated tail.
 type Space struct {
-	// FileBytes is the data file's size.
+	// FileBytes is the data file's size, including the tail bbolt grows the
+	// file by ahead of use, which holds no page yet.
 	FileBytes int64
+	// InUseBytes is the pages below bbolt's high-water mark, as the newest
+	// valid meta page records it, less FreeBytes.
+	InUseBytes int64
 	// FreeBytes is free and pending pages times the page size, as of the
 	// last write commit or the open. Pending pages count: they become
 	// reusable once the readers pinning them finish, and compaction drops
@@ -50,8 +55,9 @@ type Space struct {
 	FreeBytes int64
 }
 
-// Space reads the file's size and free bytes without a transaction or a page
-// walk. After Close it returns an error matching bbolt's
+// Space reads the file's size, in-use and free bytes without a transaction or
+// a page walk: the high-water mark comes from the file's meta pages, read
+// without mapping. After Close it returns an error matching bbolt's
 // ErrDatabaseNotOpen.
 func (db *DB) Space() (Space, error) {
 	if db.closed.Load() {
@@ -64,11 +70,27 @@ func (db *DB) Space() (Space, error) {
 // Path is empty and Info panics (https://github.com/etcd-io/bbolt/blob/v1.5.0/db.go#L1124),
 // while Stats stays safe.
 func spaceOf(bdb *bbolt.DB, path string, pageSize int) (Space, error) {
-	fi, err := os.Stat(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return Space{}, fmt.Errorf("bolttable: space: %w", err)
 	}
-	return Space{FileBytes: fi.Size(), FreeBytes: freeBytes(new(bdb.Stats()), pageSize)}, nil
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		return Space{}, fmt.Errorf("bolttable: space: %w", err)
+	}
+	size := uint64(fi.Size()) //nolint:gosec // a file's size is never negative
+	// A commit rewriting one meta page leaves the other valid, so a torn read
+	// picks the previous commit's.
+	m, ok := chosenMeta(f, size)
+	if !ok {
+		return Space{}, fmt.Errorf("%w: %s: space: no valid meta page", ErrInvalidFile, path)
+	}
+	free := freeBytes(new(bdb.Stats()), pageSize)
+	// The meta and the freelist counts are read apart, so a commit between them
+	// can leave free briefly above the high water.
+	inUse := max(int64(m.pgid*m.pageSize)-free, 0) //nolint:gosec // pgid pages fit in the file's size
+	return Space{FileBytes: fi.Size(), InUseBytes: inUse, FreeBytes: free}, nil
 }
 
 // Stats reads the file's statistics in one read transaction, walking every

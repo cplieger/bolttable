@@ -561,6 +561,9 @@ func TestReadDBSpaceReportsFree(t *testing.T) {
 	if sp.FreeBytes == 0 || sp.FileBytes != fi.Size() {
 		t.Errorf("Space = %+v, file %d bytes; want free bytes and the file's size", sp, fi.Size())
 	}
+	if want := highWater(t, rdb.db) - sp.FreeBytes; sp.InUseBytes != want {
+		t.Errorf("Space = %+v; want InUseBytes %d, the high water less the free bytes", sp, want)
+	}
 }
 
 func TestReadDBBackup(t *testing.T) {

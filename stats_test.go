@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"go.etcd.io/bbolt"
 	bbolterrors "go.etcd.io/bbolt/errors"
 )
 
@@ -186,6 +187,54 @@ func TestSpaceMatchesStats(t *testing.T) {
 	}
 	if st := stats(t, db); st.Space != sp {
 		t.Errorf("Space() = %+v, Stats().Space = %+v", sp, st.Space)
+	}
+}
+
+// highWater is the bytes below bbolt's high-water page, read in a
+// transaction as Space must not.
+func highWater(t *testing.T, db *DB) int64 {
+	t.Helper()
+	var hw int64
+	if err := db.bolt.View(func(btx *bbolt.Tx) error { hw = btx.Size(); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	return hw
+}
+
+func TestSpaceInUseExcludesPreallocatedTail(t *testing.T) {
+	f := newFixture(t)
+	db := mustOpen(t, tempPath(t), f.schema, Options{})
+	update(t, db, func(tx *Tx) error {
+		for i := range uint64(3000) {
+			if err := f.items.Put(tx, i, &item{Name: fmt.Sprintf("%0150d", i)}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	sp, err := db.Space()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hw := highWater(t, db)
+	if hw >= sp.FileBytes {
+		t.Fatalf("fixture: high water %d, file %d bytes; want bbolt to have grown the file past its data", hw, sp.FileBytes)
+	}
+	if want := hw - sp.FreeBytes; sp.InUseBytes != want {
+		t.Errorf("Space = %+v, high water %d; want InUseBytes %d, the high water less the free bytes", sp, hw, want)
+	}
+}
+
+func TestSpaceInUseAfterDeletes(t *testing.T) {
+	f := newFixture(t)
+	db := mustOpen(t, tempPath(t), f.schema, Options{})
+	fillAndThin(t, db, f)
+	sp, err := db.Space()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := highWater(t, db) - sp.FreeBytes; sp.InUseBytes != want || sp.InUseBytes+sp.FreeBytes > sp.FileBytes {
+		t.Errorf("Space = %+v; want InUseBytes %d and InUseBytes+FreeBytes within FileBytes", sp, want)
 	}
 }
 

@@ -29,8 +29,11 @@ type commitSlot struct {
 	prev  *commitSlot
 	done  chan struct{}
 	items []slotItem
-	once  sync.Once
-	txid  uint64
+	// admits are the admissions of btx's calls, returned before any callback
+	// so a slow callback never holds the writer.
+	admits []func()
+	once   sync.Once
+	txid   uint64
 }
 
 // slotItem is one successful run's delivery: its change, nil for a commit
@@ -73,6 +76,8 @@ func (db *DB) slot(btx *bbolt.Tx) *commitSlot {
 // deliver runs s's callbacks once every earlier slot's have run. done closes
 // even when a callback panics, so one panic cannot wedge later commits.
 func (db *DB) deliver(s *commitSlot) {
+	runAll(s.admits)
+	s.admits = nil
 	if beforeDeliver != nil {
 		beforeDeliver(s.txid)
 	}

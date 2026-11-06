@@ -27,10 +27,10 @@ type Lock struct {
 // once, negative is an error, and another holder fails it with ErrLocked. It
 // creates <path>.lock, mode 0600, and never removes or renames it. Pass the
 // Lock as Options.Lock to Open path under it. The lock, flock(2) on Linux,
-// the BSDs and Darwin and LockFileEx on Windows, excludes other processes
-// and other handles in this one only on a local filesystem: NFS and, since
-// Linux 5.5, CIFS emulate flock with per-process byte-range locks. Other
-// platforms get an error wrapping errors.ErrUnsupported.
+// the BSDs and Darwin, excludes other processes and other handles in this
+// one only on a local filesystem: NFS and, since Linux 5.5, CIFS emulate
+// flock with per-process byte-range locks. Other platforms, Windows
+// included, get an error wrapping errors.ErrUnsupported.
 func LockPath(path string, wait time.Duration) (*Lock, error) {
 	if wait < 0 {
 		return nil, fmt.Errorf("bolttable: negative lock wait %v", wait)

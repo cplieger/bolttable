@@ -4,7 +4,7 @@
 
 bolttable gives your Go code typed tables, declared indexes and a change feed over one bbolt file.
 
-It replaces the hand-written bucket code, index upkeep, migration ladder and startup steps that grow around a bbolt store. It depends only on bbolt, `golang.org/x/sys` and the standard library, needs Go 1.27.3 or later and is licensed under Apache-2.0.
+It replaces the hand-written bucket code, index upkeep, migration ladder and startup steps that grow around a bbolt store. It depends only on bbolt, `golang.org/x/sys` and the standard library, needs Go 1.27.3 or later and is licensed under Apache-2.0. It runs on Linux, macOS and the BSDs; on Windows and other platforms, `Open`, `OpenReadOnly` and `LockPath` return an error wrapping `errors.ErrUnsupported`.
 
 ## Why use it
 

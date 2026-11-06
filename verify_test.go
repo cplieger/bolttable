@@ -2,6 +2,8 @@ package bolttable
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"math"
 	"slices"
 	"testing"
@@ -292,5 +294,44 @@ func TestVerifyCounterSumOutsideInt64(t *testing.T) {
 				return nil
 			})
 		})
+	}
+}
+
+func TestVerifyRepairContextDoneBeforeCommitRollsBack(t *testing.T) {
+	var cancel context.CancelFunc
+	s := NewSchema("test")
+	a := Must(s.Namespace("a"))
+	items := Must(Define(a, 0x10, "items", Uint64Key{}, JSON[item](1), TableOptions{}))
+	Must(DefineIndex(items, "by_name", IndexOptions{Unique: true, Version: 1}, func(_ uint64, v *item) []Entry {
+		if cancel != nil {
+			cancel()
+		}
+		return []Entry{{Key: []byte(v.Name)}}
+	}))
+	path := tempPath(t)
+	db, err := Open(path, s, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	update(t, db, func(tx *Tx) error { return items.Put(tx, 1, &item{Name: "one"}) })
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rawUpdate(t, path, func(btx *bbolt.Tx) error {
+		return nsBucket(btx, "a", "index:by_name").Delete([]byte("one"))
+	})
+	db = mustOpen(t, path, s, Options{})
+	ctx, c := context.WithCancel(t.Context())
+	cancel = c
+	if _, err := db.Verify(ctx, true); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Verify(repair) = %v, want context.Canceled", err)
+	}
+	cancel = nil
+	rep, err := db.Verify(t.Context(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := byName(rep)["a.by_name"]; got.Missing != 1 {
+		t.Errorf("after the cancelled repair: a.by_name = %+v, want the entry still missing", got)
 	}
 }

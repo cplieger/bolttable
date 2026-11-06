@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"go.etcd.io/bbolt"
+	"golang.org/x/sync/semaphore"
 )
 
 // boltTryOnce makes bbolt try its flock once: its retry loop gives up when
@@ -60,13 +61,13 @@ type Options struct {
 	// is allowed.
 	OnCommit func(Change)
 	// CommitFault, for tests of a caller's write-fault handling, is asked
-	// once per run of every Update and Batch call, after fn, BeforeCommit
-	// and the change record, with the call's context; Verify's repair never
-	// asks it. A non-nil error fails the run as a failed bbolt commit would:
-	// it rolls back, runs no callback, and the call returns an error
-	// wrapping ErrCommit and the hook's error. In a Batch group it fails
-	// only the calls it selects, on every rerun, where a real commit failure
-	// fails the whole group. Production leaves it nil.
+	// once per run of every Update and Batch call whose context is not done
+	// after fn, BeforeCommit and the change record, with that context;
+	// Verify's repair never asks it. A non-nil error fails the run as a
+	// failed bbolt commit would: it rolls back, runs no callback, and the
+	// call returns an error wrapping ErrCommit and the hook's error. In a
+	// Batch group it fails only the calls it selects, on every rerun, where a
+	// real commit failure fails the whole group. Production leaves it nil.
 	CommitFault func(ctx context.Context) error
 	// Lock is a lock the caller took with LockPath(path, …) and still holds.
 	// Open runs under it instead of taking its own, and Close leaves it
@@ -116,6 +117,9 @@ type DB struct {
 	// cur is the newest write transaction's slot, touched only inside bbolt
 	// write transaction bodies.
 	cur *commitSlot
+	// writers admits write transactions (DB.commit): Update and Verify's
+	// repair take all of it, a Batch call one unit so concurrent calls group.
+	writers *semaphore.Weighted
 	// unlock releases the lock Open took, or frees an adopted one.
 	unlock func() error
 	report OpenReport
@@ -153,7 +157,7 @@ func start(bdb *bbolt.DB, s *Schema, o *Options, want map[string][32]byte, wtx *
 			return nil, fmt.Errorf("bolttable: create namespaces: %w", err)
 		}
 	}
-	db := &DB{bolt: bdb, schema: s, opts: *o, path: bdb.Path(), pageSize: bdb.Info().PageSize}
+	db := &DB{bolt: bdb, schema: s, opts: *o, path: bdb.Path(), pageSize: bdb.Info().PageSize, writers: semaphore.NewWeighted(exclusive)}
 	if err := bdb.View(func(btx *bbolt.Tx) error {
 		db.baseTxID = txID(btx)
 		db.cur = closedSlot(db.baseTxID)

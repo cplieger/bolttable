@@ -34,7 +34,7 @@ type VerifyReport struct {
 // entry and counter. With repair it rewrites index entries and counters, and
 // only those: it never rewrites or deletes a row, so an undecodable row stays
 // reported with Repaired false, and its remedy is a restore. A repair writes
-// no revision.
+// no revision and honors ctx as Update does.
 func (db *DB) Verify(ctx context.Context, repair bool) (VerifyReport, error) {
 	if err := ctx.Err(); err != nil {
 		return VerifyReport{}, err
@@ -57,7 +57,12 @@ func (db *DB) Verify(ctx context.Context, repair bool) (VerifyReport, error) {
 	if !repair {
 		return rep, db.bolt.View(walk)
 	}
-	return rep, db.commit(db.bolt.Update, func(btx *bbolt.Tx, _ *commitSlot) error { return walk(btx) })
+	return rep, db.commit(ctx, exclusive, db.bolt.Update, func(btx *bbolt.Tx, _ *commitSlot) error {
+		if err := walk(btx); err != nil {
+			return err
+		}
+		return ctx.Err()
+	})
 }
 
 // rescan is what a table's rows derive: per index the stored pairs they

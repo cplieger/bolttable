@@ -13,7 +13,7 @@ It replaces the hand-written bucket code, index upkeep, migration ladder and sta
 - Each transaction that changes a non-silent table records one change at the next revision. `Since` returns changes after a revision you hold, a page at a time, and `OnCommit` receives every commit in commit order.
 - Each schema namespace has its own format digest. A changed declaration fails `Open` naming only that namespace, unless your reset policy allows it: `Open` then keeps a copy of the file, empties that namespace, and the others keep their rows.
 - `Open` takes a lock file beside the data file and does every startup step under it. It removes stranded temporary files, can move a corrupt or truncated file aside, resets, compacts and reports what it did. A second process gets `ErrLocked` after a wait you choose.
-- `OpenReadOnly` opens a file for a report or a restore check and has no write method. `Space` reads the file's size and free bytes without a transaction, `Backup` copies the file while it stays open, and `WriteHealth` tracks, per class of write, whether commits are failing and since when, for a health check.
+- `OpenReadOnly` opens a file for a report or a restore check and has no write method. `Space` reads the file's size, the bytes its data uses and the bytes bbolt can reuse, without a transaction, `Backup` copies the file while it stays open, and `WriteHealth` tracks, per class of write, whether commits are failing and since when, for a health check.
 
 Consider [storm](https://github.com/asdine/storm) or [bolthold](https://github.com/timshannon/bolthold) if you want tables from struct tags and queries built at run time, or bbolt alone for a few buckets.
 

@@ -151,7 +151,7 @@ func (db *ReadDB) Verify(ctx context.Context) (VerifyReport, error) {
 // Stats reads the file's statistics as DB.Stats does; Commits is 0.
 func (db *ReadDB) Stats(ctx context.Context) (Stats, error) { return db.db.Stats(ctx) }
 
-// Space reads the file's size and free bytes as DB.Space does.
+// Space reads the file's size, in-use and free bytes as DB.Space does.
 func (db *ReadDB) Space() (Space, error) { return db.db.Space() }
 
 // Backup writes a compacted copy of the file to path as DB.Backup does.

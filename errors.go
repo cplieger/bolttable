@@ -41,6 +41,11 @@ var (
 	// mapped but not locked, and bbolt walks a NoFreelistSync file on an
 	// unguarded goroutine.
 	ErrInvalidFile = errors.New("bolttable: invalid database file")
+	// ErrReset reports that Open could not run a reset Options.Reset allowed:
+	// keeping the copy, or the reset transaction, failed, and the file is
+	// left as it was. A file found unreadable during the reset is
+	// ErrInvalidFile instead.
+	ErrReset = errors.New("bolttable: reset failed")
 )
 
 var (

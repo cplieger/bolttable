@@ -31,11 +31,14 @@ type ReadDB struct{ db *DB }
 // ErrLocked meanwhile, and fails with ErrLocked when a writer keeps it past
 // o.LockWait. An absent or empty file wraps fs.ErrNotExist, an unreadable
 // one ErrInvalidFile; a file Open would reset or complete fails with a
-// *FormatError whose Missing names what Open would create. The lock has
-// LockPath's filesystem and platform limits.
+// *FormatError whose Missing names what Open would create. The path follows
+// LockPath's rule and the lock its filesystem and platform limits.
 func OpenReadOnly(path string, s *Schema, o ReadOptions) (rdb *ReadDB, err error) {
 	if s == nil {
 		return nil, errors.New("bolttable: OpenReadOnly with a nil schema")
+	}
+	if perr := checkPath(path); perr != nil {
+		return nil, perr
 	}
 	retention, err := retentionOf(o.Retention)
 	if err != nil {

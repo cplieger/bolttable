@@ -38,9 +38,12 @@ func createExclusive(name string, flag int, perm os.FileMode) (*os.File, error) 
 // included. A failure before the link leaves no path and removes the
 // temporary file, never one Backup did not create. After the link path is
 // complete, and a failed removal of the temporary name or directory fsync
-// wraps ErrPublished.
+// wraps ErrPublished. A path naming no file is refused as LockPath refuses it.
 func (db *DB) Backup(ctx context.Context, path string) error {
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := checkPath(path); err != nil {
 		return err
 	}
 	if _, err := os.Lstat(path); err == nil {

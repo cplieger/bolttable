@@ -24,14 +24,19 @@ type Lock struct {
 }
 
 // LockPath takes the exclusive lock on path, waiting up to wait: zero tries
-// once, negative is an error, and another holder fails it with ErrLocked. It
-// creates <path>.lock, mode 0600, and never removes or renames it. Pass the
+// once, negative is an error, and another holder fails it with ErrLocked. A
+// path naming no file (empty, or ending in a separator, "." or "..") is an
+// error before anything is created. It creates <path>.lock, mode 0600, and
+// never removes or renames it. Pass the
 // Lock as Options.Lock to Open path under it. The lock, flock(2) on Linux,
 // the BSDs and Darwin, excludes other processes and other handles in this
 // one only on a local filesystem: NFS and, since Linux 5.5, CIFS emulate
 // flock with per-process byte-range locks. Other platforms, Windows
 // included, get an error wrapping errors.ErrUnsupported.
 func LockPath(path string, wait time.Duration) (*Lock, error) {
+	if err := checkPath(path); err != nil {
+		return nil, err
+	}
 	if wait < 0 {
 		return nil, fmt.Errorf("bolttable: negative lock wait %v", wait)
 	}
@@ -48,6 +53,16 @@ func LockPath(path string, wait time.Duration) (*Lock, error) {
 }
 
 func lockName(path string) string { return filepath.Clean(path) + ".lock" }
+
+// checkPath refuses a path that names no file: empty, ending in a separator,
+// or ending in "." or "..". Its lock and temporary names derive from path, so
+// each entry point runs it before touching the filesystem.
+func checkPath(path string) error {
+	if base := filepath.Base(path); path == "" || os.IsPathSeparator(path[len(path)-1]) || base == "." || base == ".." {
+		return fmt.Errorf("bolttable: path %q names no file", path)
+	}
+	return nil
+}
 
 // readLock takes the shared lock on path when its lock file exists and
 // returns what releases it. An absent lock file means no writer opened the

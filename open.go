@@ -78,11 +78,14 @@ func (db *DB) OpenReport() OpenReport {
 // without writing, applies o.InvalidFile, o.Reset and o.Compact, and creates
 // the namespaces the file lacks; OpenReport tells what it did. A format
 // change o.Reset refuses fails with the *FormatError, the file unchanged,
-// and another holder of the lock with ErrLocked. The lock has LockPath's
-// filesystem and platform limits.
+// and another holder of the lock with ErrLocked. The path follows LockPath's
+// rule and the lock its filesystem and platform limits.
 func Open(path string, s *Schema, o Options) (db *DB, err error) { //nolint:gocritic // hugeParam: callers build Options inline
 	if s == nil {
 		return nil, errors.New("bolttable: Open with a nil schema")
+	}
+	if perr := checkPath(path); perr != nil {
+		return nil, perr
 	}
 	retention, err := retentionOf(o.Retention)
 	if err != nil {

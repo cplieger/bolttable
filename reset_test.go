@@ -419,6 +419,16 @@ func TestOpenResetFailureLeavesFileUnreset(t *testing.T) {
 				return os.Remove(name)
 			}
 		},
+		// The reset transaction's handle is the procedure's first writable
+		// bbolt open; the inspection before it is read-only.
+		"reset open": func() {
+			boltOpen = func(p string, mode os.FileMode, o *bbolt.Options) (*bbolt.DB, error) {
+				if !o.ReadOnly {
+					return nil, boom
+				}
+				return bbolt.Open(p, mode, o)
+			}
+		},
 	}
 	for name, inject := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -429,10 +439,15 @@ func TestOpenResetFailureLeavesFileUnreset(t *testing.T) {
 			}
 			before := readFile(t, path)
 			inject()
-			t.Cleanup(func() { copyFile, linkFile, syncDir, removeFile = copyFileSync, os.Link, syncDirectory, os.Remove })
+			t.Cleanup(func() {
+				copyFile, linkFile, syncDir, removeFile, boltOpen = copyFileSync, os.Link, syncDirectory, os.Remove, bbolt.Open
+			})
 			_, err := Open(path, fixtureAt(t, 2).schema, Options{Reset: ResetPolicy{Allow: func(NamespaceDigest) bool { return true }, Keep: 1}})
 			if !errors.Is(err, boom) {
 				t.Errorf("Open = %v, want the injected failure", err)
+			}
+			if !errors.Is(err, ErrReset) || errors.Is(err, ErrInvalidFile) {
+				t.Errorf("Open = %v, want ErrReset and not ErrInvalidFile", err)
 			}
 			if !bytes.Equal(before, readFile(t, path)) {
 				t.Error("the live file changed")

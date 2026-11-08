@@ -510,6 +510,9 @@ func assertResetInvalid(t *testing.T, path string, policy InvalidFilePolicy) {
 		if !errors.Is(err, ErrInvalidFile) || !strings.Contains(err.Error(), "step 7") {
 			t.Errorf("Open = %v, want ErrInvalidFile naming step 7", err)
 		}
+		if errors.Is(err, ErrReset) {
+			t.Errorf("Open = %v: an unreadable file is not a reset failure", err)
+		}
 		if strings.Contains(err.Error(), "unexpected type") || strings.Contains(err.Error(), "ffff") {
 			t.Errorf("the error carries bbolt's panic text: %v", err)
 		}

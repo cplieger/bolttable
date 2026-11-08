@@ -1,7 +1,9 @@
 module github.com/cplieger/bolttable
 
-go 1.27.2
+go 1.27.3
 
-require go.etcd.io/bbolt v1.5.0
-
-require golang.org/x/sys v0.45.0 // indirect
+require (
+	go.etcd.io/bbolt v1.5.0
+	golang.org/x/sync v0.24.0
+	golang.org/x/sys v0.49.0
+)

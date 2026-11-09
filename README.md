@@ -66,7 +66,7 @@ The package example on pkg.go.dev adds a unique index, a counter, a subject that
 - `DB.Update`, `DB.Batch` and `DB.View` run transactions. `Table` has `Get`, `Put`, `Delete`, `Scan`, `NextID` and `Subject`. `Index` has `Lookup` and `Scan`, and `Counter` has `Value`. A `Range` scans a prefix, a `[From, To)` span or one `Exact` key.
 - `Tx.Mark`, `Tx.Touch` and `Tx.AfterCommit` add to a transaction's change, and `Synthetic` builds a subject that names no row. `ReadTx.Since` pages the feed and `ReadTx.Rev` reads its head. `Options.BeforeCommit` chooses what each change records.
 - `DB.Verify`, `DB.Stats`, `DB.Space` and `DB.Backup` look after the file. `WriteHealth` records write outcomes, and `Options.CommitFault` lets a test fail chosen commits.
-- `ErrFormat`, `ErrConflict`, `ErrCorrupt`, `ErrCommit`, `ErrPublished`, `ErrLocked` and `ErrInvalidFile` are the errors a caller can match, with `*FormatError` and `*ConflictError` carrying the details.
+- `ErrFormat`, `ErrConflict`, `ErrCorrupt`, `ErrCommit`, `ErrPublished`, `ErrLocked`, `ErrInvalidFile` and `ErrReset` are the errors a caller can match, with `*FormatError` and `*ConflictError` carrying the details.
 
 The full reference is on [pkg.go.dev](https://pkg.go.dev/github.com/cplieger/bolttable).
 

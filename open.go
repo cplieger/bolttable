@@ -293,15 +293,25 @@ func (p *opening) reset(fe *FormatError) error {
 	if keep := p.opts.Reset.Keep; keep > 0 {
 		kept, err := keepCopy(p.path, copyDigest(digests), keep)
 		if err != nil {
-			return err
+			return resetFailed(err)
 		}
 		p.report.Kept = kept
 	}
 	if err := resetFile(p.path, p.schema, p.want, names, &p.op); err != nil {
-		return err
+		return resetFailed(err)
 	}
 	p.report.Reset, p.measure = digests, nil
 	return nil
+}
+
+// resetFailed marks a failure of the reset step with ErrReset, unless it
+// found the file unreadable, which stays ErrInvalidFile so InvalidFile's
+// policy applies.
+func resetFailed(err error) error {
+	if errors.Is(err, ErrInvalidFile) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrReset, err)
 }
 
 // allowed asks Allow about every name fe lists, in order, and reports

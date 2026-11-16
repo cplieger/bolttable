@@ -183,6 +183,10 @@ func (t *Table[K, V]) Delete(tx *Tx, k K) (bool, error) {
 	return tx.deleteRow(t.def, t.key.AppendKey(nil, k))
 }
 
+// Prefix returns the table's prefix byte, the first byte of each of its
+// rows' subjects.
+func (t *Table[K, V]) Prefix() byte { return t.def.prefix }
+
 // Subject returns the change-feed subject of the row under k.
 func (t *Table[K, V]) Subject(k K) Subject {
 	return t.key.AppendKey([]byte{t.def.prefix}, k)

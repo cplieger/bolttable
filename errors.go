@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	bbolterrors "go.etcd.io/bbolt/errors"
 )
 
 var (
@@ -46,7 +48,16 @@ var (
 	// left as it was. A file found unreadable during the reset is
 	// ErrInvalidFile instead.
 	ErrReset = errors.New("bolttable: reset failed")
+	// ErrClosed reports a call on a closed DB or ReadDB, where the error also
+	// matches bbolt's ErrDatabaseNotOpen. A writer that runs on its own
+	// schedule reads it as a skipped write, never as a storage fault: it
+	// never wraps ErrCommit.
+	ErrClosed = errors.New("bolttable: database is closed")
 )
+
+// errDBClosed is every call's error on a closed DB. It keeps bbolt's
+// sentinel, so a caller matching ErrDatabaseNotOpen keeps working.
+var errDBClosed = fmt.Errorf("%w: %w", ErrClosed, bbolterrors.ErrDatabaseNotOpen)
 
 var (
 	errTxClosed = errors.New("bolttable: transaction has ended")

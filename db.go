@@ -206,7 +206,8 @@ func txID(btx *bbolt.Tx) uint64 {
 
 // Close closes the file, waiting for open transactions, then releases the
 // lock Open took or frees an adopted one, which stays held. A second Close
-// returns nil.
+// returns nil. Every later call answers an error matching both ErrClosed and
+// bbolt's ErrDatabaseNotOpen.
 func (db *DB) Close() error {
 	if !db.closed.CompareAndSwap(false, true) {
 		return nil

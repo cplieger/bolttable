@@ -31,8 +31,8 @@ type WriteRecord struct {
 // Record notes the result of one Update or Batch call of class and returns
 // the class's record after it. nil records a commit, which clears a failing
 // run of that class only; an error wrapping ErrCommit records a failure;
-// every other error (the function's own, *ConflictError, ErrCorrupt, a
-// context error) changes nothing.
+// every other error (the function's own, *ConflictError, ErrCorrupt,
+// ErrClosed, a context error) changes nothing.
 func (h *WriteHealth) Record(class string, err error) WriteRecord {
 	h.mu.Lock()
 	defer h.mu.Unlock()

@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"go.etcd.io/bbolt"
+	bbolterrors "go.etcd.io/bbolt/errors"
 )
 
 type txPhase uint8
@@ -72,7 +73,26 @@ func (db *DB) View(ctx context.Context, fn func(*ReadTx) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return db.bolt.View(func(btx *bbolt.Tx) error { return fn(&ReadTx{db: db, btx: btx}) })
+	return db.view(func(btx *bbolt.Tx) error { return fn(&ReadTx{db: db, btx: btx}) })
+}
+
+// view runs fn in a bbolt read transaction and returns fn's error as is.
+// bbolt's own refusal to begin on a closed file is the closed DB's error,
+// which also covers a call that raced Close.
+func (db *DB) view(fn func(*bbolt.Tx) error) error {
+	err := db.bolt.View(func(btx *bbolt.Tx) error {
+		if err := fn(btx); err != nil {
+			return &runError{err: err}
+		}
+		return nil
+	})
+	if re, ok := errors.AsType[*runError](err); ok {
+		return re.err
+	}
+	if errors.Is(err, bbolterrors.ErrDatabaseNotOpen) {
+		return errDBClosed
+	}
+	return err
 }
 
 // runError carries the error a run returned through bbolt, which hands it
@@ -89,7 +109,7 @@ func (e *faultError) Error() string { return e.err.Error() }
 
 // commit admits the call as a writer of weight w, runs fn through bbolt's
 // Update or Batch, in btx's slot, and returns fn's error as is, or bbolt's
-// own failure wrapped in ErrCommit. On any error it abandons the slot its
+// own failure wrapped in ErrCommit, or the closed DB's error. On any error it abandons the slot its
 // last run used, so later commits stop waiting on it. The run's error is told
 // apart by its type, never compared: a caller's error may be uncomparable,
 // and a Batch call's earlier failed run may leave an error that its solo
@@ -124,6 +144,9 @@ func (db *DB) commit(ctx context.Context, w int64, through func(func(*bbolt.Tx) 
 	}
 	if fe, ok := errors.AsType[*faultError](err); ok {
 		return fmt.Errorf("%w: %w", ErrCommit, fe.err)
+	}
+	if errors.Is(err, bbolterrors.ErrDatabaseNotOpen) {
+		return errDBClosed
 	}
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrCommit, err)

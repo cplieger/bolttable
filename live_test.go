@@ -700,3 +700,66 @@ func TestLiveSwapConcurrent(t *testing.T) {
 		t.Error("no call ran between the swaps")
 	}
 }
+
+func TestRefuseSetsErrOnClosedHandle(t *testing.T) {
+	f := newFixture(t)
+	t.Run("until Swap", func(t *testing.T) {
+		path := tempPath(t)
+		l := newLive(t, path, f.schema, Options{})
+		l.Refuse(errBoom)
+		if err := l.Err(); !errors.Is(err, errBoom) {
+			t.Errorf("Err after Refuse = %v, want errBoom", err)
+		}
+		for name, call := range liveCalls(t, l, f) {
+			t.Run(name, func(t *testing.T) {
+				if err := call(); !errors.Is(err, ErrClosed) || !errors.Is(err, errBoom) {
+					t.Errorf("%s = %v, want ErrClosed wrapping errBoom", name, err)
+				}
+			})
+		}
+		if err := l.Swap(t.Context(), moveIn(storedWith(t, f, "new"), path)); err != nil {
+			t.Fatalf("Swap = %v", err)
+		}
+		if err := l.Err(); err != nil {
+			t.Errorf("Err after the swap = %v, want nil", err)
+		}
+		assertName(t, l, f, "new")
+	})
+	t.Run("until Open", func(t *testing.T) {
+		l := newLive(t, tempPath(t), f.schema, Options{})
+		l.Refuse(errBoom)
+		if err := l.Open(); err != nil {
+			t.Fatalf("Open = %v", err)
+		}
+		if err := l.Err(); err != nil {
+			t.Errorf("Err after Open = %v, want nil", err)
+		}
+	})
+	t.Run("after Close", func(t *testing.T) {
+		l := newLive(t, tempPath(t), f.schema, Options{})
+		if err := l.Close(); err != nil {
+			t.Fatal(err)
+		}
+		l.Refuse(errBoom)
+		if err := l.Err(); !errors.Is(err, ErrClosed) || errors.Is(err, errBoom) {
+			t.Errorf("Err after Close and Refuse = %v, want ErrClosed alone", err)
+		}
+	})
+}
+
+func TestRefuseOnOpenHandleDoesNothing(t *testing.T) {
+	f := newFixture(t)
+	l := openLive(t, tempPath(t), f.schema, Options{})
+	epoch := l.Epoch()
+	l.Refuse(errBoom)
+	if err := l.Err(); err != nil {
+		t.Errorf("Err after Refuse on an open handle = %v, want nil", err)
+	}
+	if err := putName(t.Context(), l, f, "still"); err != nil {
+		t.Errorf("Update after Refuse on an open handle = %v", err)
+	}
+	assertName(t, l, f, "still")
+	if l.Epoch() != epoch {
+		t.Error("Refuse on an open handle reopened it")
+	}
+}

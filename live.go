@@ -335,3 +335,20 @@ func (l *Live) Close() error {
 	}
 	return err
 }
+
+// Refuse sets Err to err on a handle that is not open, such as a blocked
+// start's, until an Open or Swap opens it; every call answers ErrClosed
+// wrapping err. On an open handle, after Close, or with a nil err it does
+// nothing. It waits for an Open, Swap or Close in progress.
+func (l *Live) Refuse(err error) {
+	if err == nil {
+		return
+	}
+	l.ops <- struct{}{}
+	defer func() { <-l.ops }()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.state == liveClosed {
+		l.err = err
+	}
+}

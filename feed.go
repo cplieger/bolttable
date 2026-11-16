@@ -47,6 +47,9 @@ func (r *ReadTx) Since(after uint64, limit int) (ChangePage, error) {
 		return ChangePage{Full: true}, nil
 	}
 	page := ChangePage{Changes: []Change{}}
+	if log == nil {
+		return page, nil
+	}
 	c := log.Cursor()
 	for k, v := c.Seek(be64(after + 1)); k != nil; k, v = c.Next() {
 		if len(page.Changes) == limit {
@@ -78,6 +81,9 @@ func (r *ReadTx) Rev() (uint64, error) {
 
 func (r *ReadTx) feed() (lib, log *bbolt.Bucket, err error) {
 	lib = r.btx.Bucket([]byte(libBucket))
+	if r.beforeOpen && (lib == nil || lib.Bucket(keyChanges) == nil) {
+		return lib, nil, nil
+	}
 	if lib == nil {
 		return nil, nil, fmt.Errorf("%w: no library bucket", ErrCorrupt)
 	}
@@ -106,8 +112,9 @@ func readHead(lib *bbolt.Bucket) (uint64, error) {
 
 // oldestRetained is the lowest revision Since may return: the first stored
 // one within the newest retention revisions, or head+1 when none is.
+// A nil log holds none.
 func oldestRetained(log *bbolt.Bucket, head, retention uint64) (uint64, error) {
-	if retention == 0 {
+	if retention == 0 || log == nil {
 		return head + 1, nil
 	}
 	lo := uint64(1)

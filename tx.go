@@ -39,6 +39,10 @@ type Tx struct {
 type ReadTx struct {
 	db  *DB
 	btx *bbolt.Tx
+	// beforeOpen marks Options.Inspect's transaction, where a bucket the
+	// file lacks is one Open would create empty: its lookup answers a nil
+	// bucket, which every read takes as empty, in place of ErrCorrupt.
+	beforeOpen bool
 }
 
 // exclusive is the DB.writers weight a call takes to be the only writer.
@@ -342,17 +346,17 @@ func (r *ReadTx) namespace(td *tableDef) (*bbolt.Bucket, error) {
 		return nil, fmt.Errorf("bolttable: table %s is not in this file's schema", td.qname)
 	}
 	nsb := r.btx.Bucket([]byte(td.ns.name))
-	if nsb == nil {
+	if nsb == nil && !r.beforeOpen {
 		return nil, fmt.Errorf("%w: namespace %s has no bucket", ErrCorrupt, td.ns.name)
 	}
 	return nsb, nil
 }
 
 func (r *ReadTx) buckets(td *tableDef) (ns, rows *bbolt.Bucket, err error) {
-	if ns, err = r.namespace(td); err != nil {
+	if ns, err = r.namespace(td); err != nil || ns == nil {
 		return nil, nil, err
 	}
-	if rows = ns.Bucket([]byte{td.prefix}); rows == nil {
+	if rows = ns.Bucket([]byte{td.prefix}); rows == nil && !r.beforeOpen {
 		return nil, nil, fmt.Errorf("%w: table %s has no bucket", ErrCorrupt, td.qname)
 	}
 	return ns, rows, nil
@@ -365,11 +369,11 @@ func (r *ReadTx) rows(td *tableDef) (*bbolt.Bucket, error) {
 
 func (r *ReadTx) index(d *indexDef) (*bbolt.Bucket, error) {
 	ns, err := r.namespace(d.table)
-	if err != nil {
+	if err != nil || ns == nil {
 		return nil, err
 	}
 	ib := ns.Bucket(d.bucket)
-	if ib == nil {
+	if ib == nil && !r.beforeOpen {
 		return nil, fmt.Errorf("%w: index %s has no bucket", ErrCorrupt, d.qname)
 	}
 	return ib, nil

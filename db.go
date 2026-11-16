@@ -69,6 +69,14 @@ type Options struct {
 	// Batch group it fails only the calls it selects, on every rerun, where a
 	// real commit failure fails the whole group. Production leaves it nil.
 	CommitFault func(ctx context.Context) error
+	// Inspect runs once on a stored file, in a read-only transaction after
+	// the format comparison and before Open resets, compacts or creates
+	// anything. Its error refuses the open, returned as is, with the file and
+	// the lock as they were. A table, index, counter, namespace or change log
+	// the file lacks reads as empty; an absent or empty file is not inspected.
+	// A memory fault reading a page is ErrInvalidFile; any other panic reaches
+	// the caller.
+	Inspect func(*ReadTx) error
 	// Lock is a lock the caller took with LockPath(path, …) and still holds.
 	// Open runs under it instead of taking its own, and Close leaves it
 	// held. nil has Open take the lock and Close release it. Setting it with

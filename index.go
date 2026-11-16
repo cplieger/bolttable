@@ -81,7 +81,7 @@ func (ix *Index[K, V]) Lookup(r *ReadTx, key []byte) (k K, proj []byte, found bo
 		return k, nil, false, fmt.Errorf("bolttable: Lookup on non-unique index %s", ix.def.qname)
 	}
 	ib, err := r.index(ix.def)
-	if err != nil {
+	if err != nil || ib == nil {
 		return k, nil, false, err
 	}
 	v := ib.Get(key)
@@ -102,7 +102,7 @@ func (ix *Index[K, V]) Lookup(r *ReadTx, key []byte) (k K, proj []byte, found bo
 // order, until fn returns false or an error.
 func (ix *Index[K, V]) Scan(r *ReadTx, rg Range, fn func(ikey []byte, k K, proj []byte) (bool, error)) error { //nolint:gocritic // hugeParam: callers build a Range inline
 	ib, err := r.index(ix.def)
-	if err != nil {
+	if err != nil || ib == nil {
 		return err
 	}
 	cr := cursorRange{prefix: rg.Prefix, lo: rg.From, hi: rg.To, reverse: rg.Reverse}

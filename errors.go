@@ -53,7 +53,29 @@ var (
 	// schedule reads it as a skipped write, never as a storage fault: it
 	// never wraps ErrCommit.
 	ErrClosed = errors.New("bolttable: database is closed")
+	// ErrNewerBuild is what an Options.Inspect check wraps when the file
+	// carries a store version stamp above the running build's own.
+	ErrNewerBuild = errors.New("bolttable: file written by a newer build")
 )
+
+// OpenFailure names why a file cannot open as the outage class an app
+// reports in place of the error, checked in this order: "newer" for
+// ErrNewerBuild, "damaged" for ErrInvalidFile or ErrCorrupt, "format" for
+// ErrFormat, and "unreadable" for any other error. ok is false for nil and
+// for ErrLocked, which is no outage.
+func OpenFailure(err error) (class string, ok bool) {
+	switch {
+	case err == nil, errors.Is(err, ErrLocked):
+		return "", false
+	case errors.Is(err, ErrNewerBuild):
+		return "newer", true
+	case errors.Is(err, ErrInvalidFile), errors.Is(err, ErrCorrupt):
+		return "damaged", true
+	case errors.Is(err, ErrFormat):
+		return "format", true
+	}
+	return "unreadable", true
+}
 
 // errDBClosed is every call's error on a closed DB. It keeps bbolt's
 // sentinel, so a caller matching ErrDatabaseNotOpen keeps working.

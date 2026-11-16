@@ -146,7 +146,7 @@ func (t *Table[K, V]) facts(kb, vb []byte) (rowFacts, error) {
 // value that does not decode is ErrCorrupt.
 func (t *Table[K, V]) Get(r *ReadTx, k K) (v V, found bool, err error) {
 	b, err := r.rows(t.def)
-	if err != nil {
+	if err != nil || b == nil {
 		return v, false, err
 	}
 	kb := t.key.AppendKey(nil, k)
@@ -208,7 +208,7 @@ func (t *Table[K, V]) NextID(tx *Tx) (uint64, error) {
 // write transaction fn may write the table it scans.
 func (t *Table[K, V]) Scan(r *ReadTx, rg Range, fn func(K, *V) (bool, error)) error { //nolint:gocritic // hugeParam: callers build a Range inline
 	b, err := r.rows(t.def)
-	if err != nil {
+	if err != nil || b == nil {
 		return err
 	}
 	return scanBucket(b, &cursorRange{prefix: rg.Prefix, lo: rg.From, hi: rg.To, reverse: rg.Reverse}, r.btx.Writable(),

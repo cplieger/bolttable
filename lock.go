@@ -147,15 +147,30 @@ func (l *Lock) Release() error {
 func (l *Lock) adopt(path string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if err := l.checkLocked(path); err != nil {
+		return err
+	}
+	if l.inUse {
+		return fmt.Errorf("%w: %s backs another open DB", ErrLocked, l.path)
+	}
+	l.inUse = true
+	return nil
+}
+
+// check refuses l for path when an adopt of it would be the caller's bug.
+func (l *Lock) check(path string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.checkLocked(path)
+}
+
+func (l *Lock) checkLocked(path string) error {
 	switch {
 	case l.released:
 		return errors.New("bolttable: Open under a released Lock")
 	case l.path != lockName(path):
 		return fmt.Errorf("bolttable: Open of %s under the lock %s", path, l.path)
-	case l.inUse:
-		return fmt.Errorf("%w: %s backs another open DB", ErrLocked, l.path)
 	}
-	l.inUse = true
 	return nil
 }
 

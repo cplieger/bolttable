@@ -81,30 +81,9 @@ func (db *DB) OpenReport() OpenReport {
 // and another holder of the lock with ErrLocked. The path follows LockPath's
 // rule and the lock its filesystem and platform limits.
 func Open(path string, s *Schema, o Options) (db *DB, err error) { //nolint:gocritic // hugeParam: callers build Options inline
-	if s == nil {
-		return nil, errors.New("bolttable: Open with a nil schema")
-	}
-	if perr := checkPath(path); perr != nil {
-		return nil, perr
-	}
-	retention, err := retentionOf(o.Retention)
+	retention, err := checkOpen(path, s, &o)
 	if err != nil {
 		return nil, err
-	}
-	if o.MaxBatchSize < 0 || o.MaxBatchDelay < 0 {
-		return nil, fmt.Errorf("bolttable: negative batch limit (MaxBatchSize %d, MaxBatchDelay %v)", o.MaxBatchSize, o.MaxBatchDelay)
-	}
-	if o.Reset.Keep < 0 {
-		return nil, fmt.Errorf("bolttable: negative Reset.Keep %d", o.Reset.Keep)
-	}
-	if cerr := o.Compact.validate(); cerr != nil {
-		return nil, cerr
-	}
-	if o.InvalidFile > InvalidFileMoveAside {
-		return nil, fmt.Errorf("bolttable: unknown InvalidFile policy %d", o.InvalidFile)
-	}
-	if o.Lock != nil && o.LockWait != 0 {
-		return nil, fmt.Errorf("bolttable: Options.Lock with LockWait %v: Open waits for no lock it adopts", o.LockWait)
 	}
 	s.seal()
 	unlock, err := takeLock(path, o.Lock, o.LockWait)
@@ -126,6 +105,37 @@ func Open(path string, s *Schema, o Options) (db *DB, err error) { //nolint:gocr
 	db.bolt.MaxBatchSize = cmp.Or(o.MaxBatchSize, defaultMaxBatchSize)
 	db.bolt.MaxBatchDelay = cmp.Or(o.MaxBatchDelay, defaultMaxBatchDelay)
 	return db, nil
+}
+
+// checkOpen refuses arguments Open cannot run with, before anything is
+// touched, and returns the change log's retention.
+func checkOpen(path string, s *Schema, o *Options) (uint64, error) {
+	if s == nil {
+		return 0, errors.New("bolttable: Open with a nil schema")
+	}
+	if err := checkPath(path); err != nil {
+		return 0, err
+	}
+	retention, err := retentionOf(o.Retention)
+	if err != nil {
+		return 0, err
+	}
+	if o.MaxBatchSize < 0 || o.MaxBatchDelay < 0 {
+		return 0, fmt.Errorf("bolttable: negative batch limit (MaxBatchSize %d, MaxBatchDelay %v)", o.MaxBatchSize, o.MaxBatchDelay)
+	}
+	if o.Reset.Keep < 0 {
+		return 0, fmt.Errorf("bolttable: negative Reset.Keep %d", o.Reset.Keep)
+	}
+	if err := o.Compact.validate(); err != nil {
+		return 0, err
+	}
+	if o.InvalidFile > InvalidFileMoveAside {
+		return 0, fmt.Errorf("bolttable: unknown InvalidFile policy %d", o.InvalidFile)
+	}
+	if o.Lock != nil && o.LockWait != 0 {
+		return 0, fmt.Errorf("bolttable: Options.Lock with LockWait %v: Open waits for no lock it adopts", o.LockWait)
+	}
+	return retention, nil
 }
 
 // takeLock takes path's lock, or adopts the caller's, and returns what

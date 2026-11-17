@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	bbolterrors "go.etcd.io/bbolt/errors"
 )
 
 var (
@@ -24,7 +26,8 @@ var (
 	// failed page write keeps its *os.PathError and a failed fdatasync its
 	// syscall.Errno, but bbolt flattens a failure to grow the file to text
 	// (https://github.com/etcd-io/bbolt/blob/v1.5.0/db.go#L1245), so a caller
-	// classing causes by errno falls back to "other" when none matches.
+	// classing causes by errno falls back to "other" when none matches. A
+	// call on a closed DB answers ErrClosed instead.
 	ErrCommit = errors.New("bolttable: commit failed")
 	// ErrPublished reports that Backup linked a complete copy at its path,
 	// then failed to remove its temporary name or to fsync the directory.
@@ -46,7 +49,39 @@ var (
 	// left as it was. A file found unreadable during the reset is
 	// ErrInvalidFile instead.
 	ErrReset = errors.New("bolttable: reset failed")
+	// ErrClosed reports a call on a closed DB or ReadDB, where it also
+	// matches bbolt's ErrDatabaseNotOpen, and a call on a Live that is closed
+	// or swapping. A writer that runs on its own
+	// schedule reads it as a skipped write, never as a storage fault: it
+	// never wraps ErrCommit.
+	ErrClosed = errors.New("bolttable: database is closed")
+	// ErrNewerBuild is what an Options.Inspect check wraps when the file
+	// carries a store version stamp above the running build's own.
+	ErrNewerBuild = errors.New("bolttable: file written by a newer build")
 )
+
+// OpenFailure names why a file cannot open as the outage class an app
+// reports in place of the error, checked in this order: "newer" for
+// ErrNewerBuild, "damaged" for ErrInvalidFile or ErrCorrupt, "format" for
+// ErrFormat, and "unreadable" for any other error. ok is false for nil and
+// for ErrLocked, which is no outage.
+func OpenFailure(err error) (class string, ok bool) {
+	switch {
+	case err == nil, errors.Is(err, ErrLocked):
+		return "", false
+	case errors.Is(err, ErrNewerBuild):
+		return "newer", true
+	case errors.Is(err, ErrInvalidFile), errors.Is(err, ErrCorrupt):
+		return "damaged", true
+	case errors.Is(err, ErrFormat):
+		return "format", true
+	}
+	return "unreadable", true
+}
+
+// errDBClosed is every call's error on a closed DB. It keeps bbolt's
+// sentinel, so a caller matching ErrDatabaseNotOpen keeps working.
+var errDBClosed = fmt.Errorf("%w: %w", ErrClosed, bbolterrors.ErrDatabaseNotOpen)
 
 var (
 	errTxClosed = errors.New("bolttable: transaction has ended")

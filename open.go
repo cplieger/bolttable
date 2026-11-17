@@ -80,34 +80,19 @@ func (db *DB) OpenReport() OpenReport {
 // change o.Reset refuses fails with the *FormatError, the file unchanged,
 // and another holder of the lock with ErrLocked. The path follows LockPath's
 // rule and the lock its filesystem and platform limits.
-func Open(path string, s *Schema, o Options) (db *DB, err error) { //nolint:gocritic // hugeParam: callers build Options inline
-	if s == nil {
-		return nil, errors.New("bolttable: Open with a nil schema")
-	}
-	if perr := checkPath(path); perr != nil {
-		return nil, perr
-	}
-	retention, err := retentionOf(o.Retention)
+func Open(path string, s *Schema, o Options) (*DB, error) { //nolint:gocritic // hugeParam: callers build Options inline
+	return openBy(path, s, o, nil)
+}
+
+// openBy is Open run by the Live by, nil for none: only a Live's own opens
+// adopt the lock bound to it.
+func openBy(path string, s *Schema, o Options, by *Live) (db *DB, err error) { //nolint:gocritic // hugeParam: Open's Options, passed on
+	retention, err := checkOpen(path, s, &o)
 	if err != nil {
 		return nil, err
 	}
-	if o.MaxBatchSize < 0 || o.MaxBatchDelay < 0 {
-		return nil, fmt.Errorf("bolttable: negative batch limit (MaxBatchSize %d, MaxBatchDelay %v)", o.MaxBatchSize, o.MaxBatchDelay)
-	}
-	if o.Reset.Keep < 0 {
-		return nil, fmt.Errorf("bolttable: negative Reset.Keep %d", o.Reset.Keep)
-	}
-	if cerr := o.Compact.validate(); cerr != nil {
-		return nil, cerr
-	}
-	if o.InvalidFile > InvalidFileMoveAside {
-		return nil, fmt.Errorf("bolttable: unknown InvalidFile policy %d", o.InvalidFile)
-	}
-	if o.Lock != nil && o.LockWait != 0 {
-		return nil, fmt.Errorf("bolttable: Options.Lock with LockWait %v: Open waits for no lock it adopts", o.LockWait)
-	}
 	s.seal()
-	unlock, err := takeLock(path, o.Lock, o.LockWait)
+	unlock, err := takeLock(path, o.Lock, o.LockWait, by)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +101,7 @@ func Open(path string, s *Schema, o Options) (db *DB, err error) { //nolint:gocr
 			_ = unlock()
 		}
 	}()
-	p := &opening{path: path, schema: s, want: s.digests(), opts: o}
+	p := &opening{path: path, schema: s, want: s.digests(), opts: o, retention: retention}
 	if db, err = p.run(); err != nil {
 		return nil, err
 	}
@@ -128,11 +113,42 @@ func Open(path string, s *Schema, o Options) (db *DB, err error) { //nolint:gocr
 	return db, nil
 }
 
-// takeLock takes path's lock, or adopts the caller's, and returns what
-// undoes it.
-func takeLock(path string, adopted *Lock, wait time.Duration) (func() error, error) {
+// checkOpen refuses arguments Open cannot run with, before anything is
+// touched, and returns the change log's retention.
+func checkOpen(path string, s *Schema, o *Options) (uint64, error) {
+	if s == nil {
+		return 0, errors.New("bolttable: Open with a nil schema")
+	}
+	if err := checkPath(path); err != nil {
+		return 0, err
+	}
+	retention, err := retentionOf(o.Retention)
+	if err != nil {
+		return 0, err
+	}
+	if o.MaxBatchSize < 0 || o.MaxBatchDelay < 0 {
+		return 0, fmt.Errorf("bolttable: negative batch limit (MaxBatchSize %d, MaxBatchDelay %v)", o.MaxBatchSize, o.MaxBatchDelay)
+	}
+	if o.Reset.Keep < 0 {
+		return 0, fmt.Errorf("bolttable: negative Reset.Keep %d", o.Reset.Keep)
+	}
+	if err := o.Compact.validate(); err != nil {
+		return 0, err
+	}
+	if o.InvalidFile > InvalidFileMoveAside {
+		return 0, fmt.Errorf("bolttable: unknown InvalidFile policy %d", o.InvalidFile)
+	}
+	if o.Lock != nil && o.LockWait != 0 {
+		return 0, fmt.Errorf("bolttable: Options.Lock with LockWait %v: Open waits for no lock it adopts", o.LockWait)
+	}
+	return retention, nil
+}
+
+// takeLock takes path's lock, or adopts the caller's for an open by, and
+// returns what undoes it.
+func takeLock(path string, adopted *Lock, wait time.Duration, by *Live) (func() error, error) {
 	if adopted != nil {
-		if err := adopted.adopt(path); err != nil {
+		if err := adopted.adopt(path, by); err != nil {
 			return nil, err
 		}
 		return func() error { adopted.free(); return nil }, nil
@@ -155,7 +171,9 @@ type opening struct {
 	path    string
 	report  OpenReport
 	opts    Options
-	op      faultOp
+	// retention is the change log's, for Since inside Options.Inspect.
+	retention uint64
+	op        faultOp
 }
 
 // run runs the procedure. Once a file is moved aside, every error names the
@@ -216,9 +234,12 @@ func storedSize(path string) (int64, error) {
 }
 
 // prepare inspects a stored file, resets and compacts it, or moves it
-// aside.
+// aside. Options.Inspect's refusal is returned before any of it, as is.
 func (p *opening) prepare(size int64) error {
-	fe, err := p.inspect(size)
+	fe, refused, err := p.inspect(size)
+	if refused != nil {
+		return refused
+	}
 	if err == nil {
 		err = p.reset(fe)
 	}
@@ -232,44 +253,84 @@ func (p *opening) prepare(size int64) error {
 }
 
 // inspect compares the stored file with the schema through a read-only
-// handle, writing nothing, and measures its free pages.
-func (p *opening) inspect(size int64) (*FormatError, error) {
-	var fe *FormatError
-	err := readOnly(p.path, stepInspect, func(bdb *bbolt.DB) error {
+// handle, writing nothing, and measures its free pages; then it runs
+// Options.Inspect on the same handle and returns its error as refused.
+func (p *opening) inspect(size int64) (fe *FormatError, refused, err error) {
+	err = readOnly(p.path, stepInspect, func(bdb *bbolt.DB) error {
+		var cerr error
+		if fe, cerr = p.compare(bdb, size); cerr != nil {
+			return cerr
+		}
+		refused, cerr = p.runInspect(bdb)
+		return cerr
+	})
+	if refused != nil {
+		return nil, refused, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	return fe, nil, nil
+}
+
+// compare reads the stored digests and compares them with the schema inside
+// guardRead.
+func (p *opening) compare(bdb *bbolt.DB, size int64) (fe *FormatError, err error) {
+	err = guardRead(p.path, stepInspect, func() error {
 		p.measure = &freeMeasure{size: size, free: freeBytes(new(bdb.Stats()), bdb.Info().PageSize)}
 		return bdb.View(func(btx *bbolt.Tx) error {
 			p.stored = map[string][32]byte{}
-			if err := btx.ForEach(func(name []byte, b *bbolt.Bucket) error {
+			if ferr := btx.ForEach(func(name []byte, b *bbolt.Bucket) error {
 				p.stored[string(name)] = storedDigest(b)
 				return nil
-			}); err != nil {
-				return err
+			}); ferr != nil {
+				return ferr
 			}
-			_, f, err := inspect(btx, p.schema, p.want)
+			_, f, ierr := inspect(btx, p.schema, p.want)
 			fe = f
-			return err
+			return ierr
 		})
 	})
-	if err != nil {
-		return nil, err
-	}
-	return fe, nil
+	return fe, err
 }
 
-// readOnly runs fn over a read-only handle on path inside guardRead, then
-// closes the handle. openReader owns why the handle loads the freelist.
-func readOnly(path, step string, fn func(*bbolt.DB) error) error {
+// runInspect runs Options.Inspect under guardFault, not guardRead: the
+// function is the app's, so only a memory fault, or a panic in a bbolt call
+// its ReadTx marks, is the file's, returned as err. refused is fn's error.
+func (p *opening) runInspect(bdb *bbolt.DB) (refused, err error) {
+	fn := p.opts.Inspect
+	if fn == nil {
+		return nil, nil
+	}
+	db := &DB{schema: p.schema, retention: p.retention}
+	op := new(faultOp)
+	err = guardFault(p.path, stepInspect, op, func() error {
+		return bdb.View(func(btx *bbolt.Tx) error {
+			refused = fn(&ReadTx{db: db, btx: btx, op: op, beforeOpen: true})
+			return refused
+		})
+	})
+	if refused != nil {
+		return refused, nil
+	}
+	return nil, err
+}
+
+// readOnly runs fn over a read-only handle on path, then closes the handle,
+// a panic in fn included. openReader owns why the handle loads the freelist.
+func readOnly(path, step string, fn func(*bbolt.DB) error) (err error) {
 	o := boltOptions(true)
 	o.PreLoadFreelist = true
 	bdb, _, err := openBolt(path, step, o)
 	if err != nil {
 		return err
 	}
-	err = guardRead(path, step, func() error { return fn(bdb) })
-	if cerr := bdb.Close(); err == nil && cerr != nil {
-		err = fmt.Errorf("bolttable: close %s: %w", path, cerr)
-	}
-	return err
+	defer func() {
+		if cerr := bdb.Close(); err == nil && cerr != nil {
+			err = fmt.Errorf("bolttable: close %s: %w", path, cerr)
+		}
+	}()
+	return fn(bdb)
 }
 
 // reset resets every namespace fe lists when Allow accepts each, plus the

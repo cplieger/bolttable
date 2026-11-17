@@ -43,6 +43,9 @@ func (db *DB) Backup(ctx context.Context, path string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if db.closed.Load() {
+		return errDBClosed
+	}
 	if err := checkPath(path); err != nil {
 		return err
 	}
@@ -83,7 +86,7 @@ func (db *DB) Backup(ctx context.Context, path string) error {
 // copyTo walks every bucket into dst, then syncs and closes it.
 func (db *DB) copyTo(ctx context.Context, dst *bbolt.DB, path string) error {
 	w := &copier{dst: dst}
-	err := db.bolt.View(func(src *bbolt.Tx) error {
+	err := db.view(func(src *bbolt.Tx) error {
 		var err error
 		if w.tx, err = dst.Begin(true); err != nil {
 			return err

@@ -19,6 +19,11 @@
 // nothing. LockPath takes the lock for a caller's own file operations, and
 // Options.Lock runs Open under it.
 //
+// A Live is the one handle to a live file that every store of it holds.
+// Swap replaces the file under the handle: calls meanwhile answer ErrClosed,
+// calls in flight finish first, and OnOpen hooks run at each open before any
+// call is admitted. OpenFailure names an open error's outage class.
+//
 // A transaction that writes a non-silent table, Touches a subject or sets a
 // Mark reserves the next revision and records one Change, which Since
 // returns and OnCommit receives in revision order. Every slice the package

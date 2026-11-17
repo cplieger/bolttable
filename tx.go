@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"go.etcd.io/bbolt"
+	bbolterrors "go.etcd.io/bbolt/errors"
 )
 
 type txPhase uint8
@@ -38,6 +39,13 @@ type Tx struct {
 type ReadTx struct {
 	db  *DB
 	btx *bbolt.Tx
+	// op marks each bbolt call that walks pages in Options.Inspect's
+	// transaction, where a panic there is the file's; nil elsewhere.
+	op *faultOp
+	// beforeOpen marks Options.Inspect's transaction, where a bucket the
+	// file lacks is one Open would create empty: its lookup answers a nil
+	// bucket, which every read takes as empty, in place of ErrCorrupt.
+	beforeOpen bool
 }
 
 // exclusive is the DB.writers weight a call takes to be the only writer.
@@ -72,7 +80,26 @@ func (db *DB) View(ctx context.Context, fn func(*ReadTx) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return db.bolt.View(func(btx *bbolt.Tx) error { return fn(&ReadTx{db: db, btx: btx}) })
+	return db.view(func(btx *bbolt.Tx) error { return fn(&ReadTx{db: db, btx: btx}) })
+}
+
+// view runs fn in a bbolt read transaction and returns fn's error as is.
+// bbolt's own refusal to begin on a closed file is the closed DB's error,
+// which also covers a call that raced Close.
+func (db *DB) view(fn func(*bbolt.Tx) error) error {
+	err := db.bolt.View(func(btx *bbolt.Tx) error {
+		if err := fn(btx); err != nil {
+			return &runError{err: err}
+		}
+		return nil
+	})
+	if re, ok := errors.AsType[*runError](err); ok {
+		return re.err
+	}
+	if errors.Is(err, bbolterrors.ErrDatabaseNotOpen) {
+		return errDBClosed
+	}
+	return err
 }
 
 // runError carries the error a run returned through bbolt, which hands it
@@ -88,13 +115,19 @@ type faultError struct{ err error }
 func (e *faultError) Error() string { return e.err.Error() }
 
 // commit admits the call as a writer of weight w, runs fn through bbolt's
-// Update or Batch, in btx's slot, and returns fn's error as is, or bbolt's
-// own failure wrapped in ErrCommit. On any error it abandons the slot its
-// last run used, so later commits stop waiting on it. The run's error is told
+// Update or Batch, in btx's slot, and returns fn's error as is, bbolt's own
+// failure wrapped in ErrCommit, or the closed DB's error when Close refused
+// the call before admitting it. On any error it abandons the slot its last
+// run used, so later commits stop waiting on it. The run's error is told
 // apart by its type, never compared: a caller's error may be uncomparable,
 // and a Batch call's earlier failed run may leave an error that its solo
 // rerun, failing to begin, never returns.
 func (db *DB) commit(ctx context.Context, w int64, through func(func(*bbolt.Tx) error) error, fn func(*bbolt.Tx, *commitSlot) error) error {
+	if !db.enterCall() {
+		return errDBClosed
+	}
+	// Deferred so a panic in fn or a callback still lets Close return.
+	defer db.exitCall()
 	if err := db.writers.Acquire(ctx, w); err != nil {
 		return err
 	}
@@ -244,7 +277,8 @@ func (tx *Tx) Touch(s Subject) {
 // AfterCommit registers fn to run once after this transaction commits, never
 // after a rollback or a discarded Batch run; for signals about silent writes.
 // It runs after OnCommit and earlier AfterCommit functions, in commit order
-// across the DB (see Options.OnCommit).
+// across the DB, under OnCommit's rules, which name the DB and Live calls
+// that deadlock inside it (see Options.OnCommit).
 func (tx *Tx) AfterCommit(fn func()) {
 	tx.mustRun()
 	tx.after = append(tx.after, fn)
@@ -318,18 +352,23 @@ func (r *ReadTx) namespace(td *tableDef) (*bbolt.Bucket, error) {
 	if td.ns.schema != r.db.schema {
 		return nil, fmt.Errorf("bolttable: table %s is not in this file's schema", td.qname)
 	}
+	r.op.enter()
 	nsb := r.btx.Bucket([]byte(td.ns.name))
-	if nsb == nil {
+	r.op.leave()
+	if nsb == nil && !r.beforeOpen {
 		return nil, fmt.Errorf("%w: namespace %s has no bucket", ErrCorrupt, td.ns.name)
 	}
 	return nsb, nil
 }
 
 func (r *ReadTx) buckets(td *tableDef) (ns, rows *bbolt.Bucket, err error) {
-	if ns, err = r.namespace(td); err != nil {
+	if ns, err = r.namespace(td); err != nil || ns == nil {
 		return nil, nil, err
 	}
-	if rows = ns.Bucket([]byte{td.prefix}); rows == nil {
+	r.op.enter()
+	rows = ns.Bucket([]byte{td.prefix})
+	r.op.leave()
+	if rows == nil && !r.beforeOpen {
 		return nil, nil, fmt.Errorf("%w: table %s has no bucket", ErrCorrupt, td.qname)
 	}
 	return ns, rows, nil
@@ -342,11 +381,13 @@ func (r *ReadTx) rows(td *tableDef) (*bbolt.Bucket, error) {
 
 func (r *ReadTx) index(d *indexDef) (*bbolt.Bucket, error) {
 	ns, err := r.namespace(d.table)
-	if err != nil {
+	if err != nil || ns == nil {
 		return nil, err
 	}
+	r.op.enter()
 	ib := ns.Bucket(d.bucket)
-	if ib == nil {
+	r.op.leave()
+	if ib == nil && !r.beforeOpen {
 		return nil, fmt.Errorf("%w: index %s has no bucket", ErrCorrupt, d.qname)
 	}
 	return ib, nil

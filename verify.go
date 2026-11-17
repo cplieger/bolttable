@@ -55,7 +55,7 @@ func (db *DB) Verify(ctx context.Context, repair bool) (VerifyReport, error) {
 		return nil
 	}
 	if !repair {
-		return rep, db.bolt.View(walk)
+		return rep, db.view(walk)
 	}
 	return rep, db.commit(ctx, exclusive, db.bolt.Update, func(btx *bbolt.Tx, _ *commitSlot) error {
 		if err := walk(btx); err != nil {

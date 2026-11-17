@@ -1,0 +1,183 @@
+const InvalidFileFail InvalidFilePolicy = 0
+const InvalidFileMoveAside InvalidFilePolicy = 1
+const SyntheticPrefix byte = 255
+field Change.Marks []string
+field Change.Rev uint64
+field Change.Subjects []Subject
+field ChangePage.Changes []Change
+field ChangePage.Full bool
+field ChangePage.More bool
+field CompactPolicy.MinFreeBytes int64
+field CompactPolicy.MinFreeRatio float64
+field ConflictError.Index string
+field Entry.Key []byte
+field Entry.Value []byte
+field FormatError.Missing []string
+field FormatError.Namespaces []NamespaceDigest
+field IndexOptions.Unique bool
+field IndexOptions.Version uint32
+field Mismatch.Extra int
+field Mismatch.Missing int
+field Mismatch.Name string
+field Mismatch.Repaired bool
+field Mismatch.Undecodable int
+field NamespaceDigest.Name string
+field NamespaceDigest.Stored [32]byte
+field NamespaceDigest.Want [32]byte
+field NamespaceStats.Format [32]byte
+field NamespaceStats.Name string
+field NamespaceStats.Tables []TableStats
+field OpenReport.CompactErr error
+field OpenReport.Compacted bool
+field OpenReport.Invalid error
+field OpenReport.Kept string
+field OpenReport.MovedAside string
+field OpenReport.Reset []NamespaceDigest
+field Options.BeforeCommit func(*Tx, *Pending) ([]Subject, error)
+field Options.CommitFault func(context.Context) error
+field Options.Compact CompactPolicy
+field Options.InvalidFile InvalidFilePolicy
+field Options.Lock *Lock
+field Options.LockWait time.Duration
+field Options.MaxBatchDelay time.Duration
+field Options.MaxBatchSize int
+field Options.OnCommit func(Change)
+field Options.Reset ResetPolicy
+field Options.Retention int
+field Pending.Marks []string
+field Pending.Rev uint64
+field Pending.Touched []Subject
+field Range.From []byte
+field Range.Prefix []byte
+field Range.Reverse bool
+field Range.To []byte
+field ReadOptions.LockWait time.Duration
+field ReadOptions.Retention int
+field ResetPolicy.Allow func(NamespaceDigest) bool
+field ResetPolicy.Force []string
+field ResetPolicy.Keep int
+field Space.FileBytes int64
+field Space.FreeBytes int64
+field Space.InUseBytes int64
+field Stats.Commits uint64
+field Stats.Namespaces []NamespaceStats
+field Stats.Oldest uint64
+field Stats.Rev uint64
+field Stats.Space Space
+field TableOptions.Silent bool
+field TableStats.Bytes int64
+field TableStats.Name string
+field TableStats.Rows int
+field VerifyReport.Mismatches []Mismatch
+field WriteRecord.Failing bool
+field WriteRecord.Failures uint64
+field WriteRecord.FirstFailed time.Time
+field WriteRecord.LastErr error
+field WriteRecord.LastFailed time.Time
+field WriteRecord.LastOK time.Time
+func CascadeIndex[PK any, PV any, CK any, CV any] func(*Table[PK, PV], *Index[CK, CV], uint32, func(PK) []byte) error
+func CascadePrefix[PK any, PV any, CK any, CV any] func(*Table[PK, PV], *Table[CK, CV], uint32, func(PK) []byte) error
+func DefineCounter[K any, V any] func(*Table[K, V], string, uint32, func(K, *V) int64) (*Counter[K, V], error)
+func DefineIndex[K any, V any] func(*Table[K, V], string, IndexOptions, func(K, *V) []Entry) (*Index[K, V], error)
+func Define[K any, V any] func(*Namespace, byte, string, KeyCodec[K], Codec[V], TableOptions) (*Table[K, V], error)
+func Exact func([]byte) Range
+func JSON[V any] func(uint32) Codec[V]
+func LockPath func(string, time.Duration) (*Lock, error)
+func Must[T any] func(T, error) T
+func NewSchema func(string) *Schema
+func Open func(string, *Schema, Options) (*DB, error)
+func OpenReadOnly func(string, *Schema, ReadOptions) (*ReadDB, error)
+func Synthetic func([]byte) Subject
+method (*ConflictError).Error func() string
+method (*ConflictError).Is func(error) bool
+method (*Counter).Value func(*ReadTx) (int64, error)
+method (*DB).Backup func(context.Context, string) error
+method (*DB).Batch func(context.Context, func(*Tx) error) error
+method (*DB).Close func() error
+method (*DB).Epoch func() [16]byte
+method (*DB).OpenReport func() OpenReport
+method (*DB).Space func() (Space, error)
+method (*DB).Stats func(context.Context) (Stats, error)
+method (*DB).Update func(context.Context, func(*Tx) error) error
+method (*DB).Verify func(context.Context, bool) (VerifyReport, error)
+method (*DB).View func(context.Context, func(*ReadTx) error) error
+method (*FormatError).Error func() string
+method (*FormatError).Is func(error) bool
+method (*Index).Lookup func(*ReadTx, []byte) (K, []byte, bool, error)
+method (*Index).Scan func(*ReadTx, Range, func([]byte, K, []byte) (bool, error)) error
+method (*Lock).Release func() error
+method (*ReadDB).Backup func(context.Context, string) error
+method (*ReadDB).Close func() error
+method (*ReadDB).Epoch func() [16]byte
+method (*ReadDB).Space func() (Space, error)
+method (*ReadDB).Stats func(context.Context) (Stats, error)
+method (*ReadDB).Verify func(context.Context) (VerifyReport, error)
+method (*ReadDB).View func(context.Context, func(*ReadTx) error) error
+method (*ReadTx).Rev func() (uint64, error)
+method (*ReadTx).Since func(uint64, int) (ChangePage, error)
+method (*Schema).Namespace func(string) (*Namespace, error)
+method (*Table).Delete func(*Tx, K) (bool, error)
+method (*Table).Get func(*ReadTx, K) (V, bool, error)
+method (*Table).NextID func(*Tx) (uint64, error)
+method (*Table).Put func(*Tx, K, *V) error
+method (*Table).Scan func(*ReadTx, Range, func(K, *V) (bool, error)) error
+method (*Table).Subject func(K) Subject
+method (*Tx).AfterCommit func(func())
+method (*Tx).Mark func(string)
+method (*Tx).Read func() *ReadTx
+method (*Tx).Touch func(Subject)
+method (*WriteHealth).Class func(string) (WriteRecord, bool)
+method (*WriteHealth).Record func(string, error) WriteRecord
+method (BytesKey).AppendKey func([]byte, []byte) []byte
+method (BytesKey).ParseKey func([]byte) ([]byte, error)
+method (BytesKey).Version func() uint32
+method (Uint64Key).AppendKey func([]byte, uint64) []byte
+method (Uint64Key).ParseKey func([]byte) (uint64, error)
+method (Uint64Key).Version func() uint32
+type BytesKey struct
+type Change struct
+type ChangePage struct
+type Codec[V any] interface{Append([]byte, *V) ([]byte, error); Decode([]byte, *V) error; Version() uint32}
+type CompactPolicy struct
+type ConflictError struct
+type Counter[K any, V any] struct
+type DB struct
+type Entry struct
+type FormatError struct
+type IndexOptions struct
+type Index[K any, V any] struct
+type InvalidFilePolicy uint8
+type KeyCodec[K any] interface{AppendKey([]byte, K) []byte; ParseKey([]byte) (K, error); Version() uint32}
+type Lock struct
+type Mismatch struct
+type Namespace struct
+type NamespaceDigest struct
+type NamespaceStats struct
+type OpenReport struct
+type Options struct
+type Pending struct
+type Range struct
+type ReadDB struct
+type ReadOptions struct
+type ReadTx struct
+type ResetPolicy struct
+type Schema struct
+type Space struct
+type Stats struct
+type Subject []byte
+type TableOptions struct
+type TableStats struct
+type Table[K any, V any] struct
+type Tx struct
+type Uint64Key struct
+type VerifyReport struct
+type WriteHealth struct
+type WriteRecord struct
+var ErrCommit error
+var ErrConflict error
+var ErrCorrupt error
+var ErrFormat error
+var ErrInvalidFile error
+var ErrLocked error
+var ErrPublished error
+var ErrReset error

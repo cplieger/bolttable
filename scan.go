@@ -13,12 +13,16 @@ type cursorRange struct {
 	reverse        bool
 }
 
-// scanBucket visits b's keys in cr until visit returns false or an error. In
-// a write transaction visit may write b, so the cursor re-seeks from the
-// last key after each visit instead of trusting its position.
-func scanBucket(b *bbolt.Bucket, cr *cursorRange, writable bool, visit func(k, v []byte) (bool, error)) error {
+// scanBucket visits b's keys in cr, b read through r, until visit returns
+// false or an error. In a write transaction visit may write b, so the cursor
+// re-seeks from the last key after each visit instead of trusting its
+// position.
+func scanBucket(r *ReadTx, b *bbolt.Bucket, cr *cursorRange, visit func(k, v []byte) (bool, error)) error {
+	writable := r.btx.Writable()
 	c := b.Cursor()
+	r.op.enter()
 	k, v := cr.first(c)
+	r.op.leave()
 	for k != nil && cr.contains(k) {
 		last := k
 		if writable {
@@ -28,7 +32,9 @@ func scanBucket(b *bbolt.Bucket, cr *cursorRange, writable bool, visit func(k, v
 		if err != nil || !more {
 			return err
 		}
+		r.op.enter()
 		k, v = cr.next(c, last, writable)
+		r.op.leave()
 	}
 	return nil
 }

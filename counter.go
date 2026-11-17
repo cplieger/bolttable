@@ -53,10 +53,13 @@ func DefineCounter[K, V any](t *Table[K, V], name string, version uint32, weight
 // Value returns the counter's total.
 func (c *Counter[K, V]) Value(r *ReadTx) (int64, error) {
 	ns, err := r.namespace(c.def.table)
-	if err != nil {
+	if err != nil || ns == nil {
 		return 0, err
 	}
-	return readTotal(ns, c.def)
+	r.op.enter()
+	n, err := readTotal(ns, c.def)
+	r.op.leave()
+	return n, err
 }
 
 type counterTotal struct {

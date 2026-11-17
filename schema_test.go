@@ -1,7 +1,9 @@
 package bolttable
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -171,3 +173,75 @@ func TestMustReturnsValue(t *testing.T) {
 type zeroKey struct{ Uint64Key }
 
 func (zeroKey) Version() uint32 { return 0 }
+
+func TestTablePrefix(t *testing.T) {
+	f := newFixture(t)
+	cases := []struct {
+		name  string
+		table *Table[uint64, item]
+		want  byte
+	}{
+		{"items", f.items, 0x10},
+		{"silent table", f.quiet, 0x11},
+		{"other namespace", f.other, 0x20},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var p interface{ Prefix() byte } = c.table
+			if got := p.Prefix(); got != c.want {
+				t.Errorf("Prefix = 0x%02x, want 0x%02x", got, c.want)
+			}
+			if got := c.table.Subject(7)[0]; got != c.want {
+				t.Errorf("Subject's first byte = 0x%02x, want the prefix 0x%02x", got, c.want)
+			}
+		})
+	}
+}
+
+func TestSchemaPrefixesListsRecordedTables(t *testing.T) {
+	define := func(ns *Namespace, prefix byte, silent bool) {
+		Must(Define(ns, prefix, fmt.Sprintf("t%02x", prefix), Uint64Key{}, JSON[item](1), TableOptions{Silent: silent}))
+	}
+	t.Run("fixture", func(t *testing.T) {
+		if got, want := newFixture(t).schema.Prefixes(), []byte{0x10, 0x20}; !bytes.Equal(got, want) {
+			t.Errorf("Prefixes = %x, want %x", got, want)
+		}
+	})
+	t.Run("declared out of order", func(t *testing.T) {
+		s := NewSchema("order")
+		b := Must(s.Namespace("b"))
+		a := Must(s.Namespace("a"))
+		define(b, 0x40, false)
+		define(a, 0x05, false)
+		define(b, 0x07, true)
+		define(a, 0x30, false)
+		if got, want := s.Prefixes(), []byte{0x05, 0x30, 0x40}; !bytes.Equal(got, want) {
+			t.Errorf("Prefixes = %x, want %x", got, want)
+		}
+	})
+	t.Run("only silent tables", func(t *testing.T) {
+		s := NewSchema("silent")
+		define(Must(s.Namespace("a")), 0x01, true)
+		if got := s.Prefixes(); len(got) != 0 {
+			t.Errorf("Prefixes = %x, want none", got)
+		}
+	})
+	t.Run("after Open", func(t *testing.T) {
+		f := newFixture(t)
+		mustOpen(t, tempPath(t), f.schema, Options{})
+		if got, want := f.schema.Prefixes(), []byte{0x10, 0x20}; !bytes.Equal(got, want) {
+			t.Errorf("Prefixes = %x, want %x", got, want)
+		}
+	})
+	t.Run("caller owns the result", func(t *testing.T) {
+		f := newFixture(t)
+		got := f.schema.Prefixes()
+		if len(got) == 0 {
+			t.Fatal("Prefixes = none, want the fixture's two")
+		}
+		got[0] = 0x99
+		if again, want := f.schema.Prefixes(), []byte{0x10, 0x20}; !bytes.Equal(again, want) {
+			t.Errorf("Prefixes after a caller's write = %x, want %x", again, want)
+		}
+	})
+}

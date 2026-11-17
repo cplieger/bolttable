@@ -31,15 +31,9 @@ func (r *ReadTx) Since(after uint64, limit int) (ChangePage, error) {
 	if err := r.usable(); err != nil {
 		return ChangePage{}, err
 	}
-	lib, log, err := r.feed()
-	if err != nil {
-		return ChangePage{}, err
-	}
-	head, err := readHead(lib)
-	if err != nil {
-		return ChangePage{}, err
-	}
-	oldest, err := oldestRetained(log, head, r.db.retention)
+	r.op.enter()
+	log, head, oldest, err := r.window()
+	r.op.leave()
 	if err != nil {
 		return ChangePage{}, err
 	}
@@ -47,8 +41,14 @@ func (r *ReadTx) Since(after uint64, limit int) (ChangePage, error) {
 		return ChangePage{Full: true}, nil
 	}
 	page := ChangePage{Changes: []Change{}}
+	if log == nil {
+		return page, nil
+	}
 	c := log.Cursor()
-	for k, v := c.Seek(be64(after + 1)); k != nil; k, v = c.Next() {
+	r.op.enter()
+	k, v := c.Seek(be64(after + 1))
+	r.op.leave()
+	for ; k != nil; k, v = r.next(c) {
 		if len(page.Changes) == limit {
 			page.More = true
 			break
@@ -62,6 +62,34 @@ func (r *ReadTx) Since(after uint64, limit int) (ChangePage, error) {
 	return page, nil
 }
 
+// window is the change log, the head and the oldest revision Since may
+// return.
+func (r *ReadTx) window() (log *bbolt.Bucket, head, oldest uint64, err error) {
+	if head, log, err = r.head(); err != nil {
+		return nil, 0, 0, err
+	}
+	if oldest, err = oldestRetained(log, head, r.db.retention); err != nil {
+		return nil, 0, 0, err
+	}
+	return log, head, oldest, nil
+}
+
+func (r *ReadTx) head() (head uint64, log *bbolt.Bucket, err error) {
+	lib, log, err := r.feed()
+	if err != nil {
+		return 0, nil, err
+	}
+	head, err = readHead(lib)
+	return head, log, err
+}
+
+func (r *ReadTx) next(c *bbolt.Cursor) (k, v []byte) {
+	r.op.enter()
+	k, v = c.Next()
+	r.op.leave()
+	return k, v
+}
+
 // Rev returns the head revision: the newest committed one, 0 before any. It
 // fails after the transaction ended, and with ErrCorrupt when the library
 // bucket, the change log or the head is damaged.
@@ -69,15 +97,17 @@ func (r *ReadTx) Rev() (uint64, error) {
 	if err := r.usable(); err != nil {
 		return 0, err
 	}
-	lib, _, err := r.feed()
-	if err != nil {
-		return 0, err
-	}
-	return readHead(lib)
+	r.op.enter()
+	head, _, err := r.head()
+	r.op.leave()
+	return head, err
 }
 
 func (r *ReadTx) feed() (lib, log *bbolt.Bucket, err error) {
 	lib = r.btx.Bucket([]byte(libBucket))
+	if r.beforeOpen && (lib == nil || lib.Bucket(keyChanges) == nil) {
+		return lib, nil, nil
+	}
 	if lib == nil {
 		return nil, nil, fmt.Errorf("%w: no library bucket", ErrCorrupt)
 	}
@@ -106,8 +136,9 @@ func readHead(lib *bbolt.Bucket) (uint64, error) {
 
 // oldestRetained is the lowest revision Since may return: the first stored
 // one within the newest retention revisions, or head+1 when none is.
+// A nil log holds none.
 func oldestRetained(log *bbolt.Bucket, head, retention uint64) (uint64, error) {
-	if retention == 0 {
+	if retention == 0 || log == nil {
 		return head + 1, nil
 	}
 	lo := uint64(1)

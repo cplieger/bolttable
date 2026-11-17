@@ -6,7 +6,6 @@ import (
 	"os"
 
 	"go.etcd.io/bbolt"
-	bbolterrors "go.etcd.io/bbolt/errors"
 )
 
 // TableStats is one table's row count and the bytes its pages use.
@@ -57,11 +56,11 @@ type Space struct {
 
 // Space reads the file's size, in-use and free bytes without a transaction or
 // a page walk: the high-water mark comes from the file's meta pages, read
-// without mapping. After Close it returns an error matching bbolt's
-// ErrDatabaseNotOpen.
+// without mapping. After Close it returns an error matching both ErrClosed
+// and bbolt's ErrDatabaseNotOpen.
 func (db *DB) Space() (Space, error) {
 	if db.closed.Load() {
-		return Space{}, fmt.Errorf("bolttable: space: %w", bbolterrors.ErrDatabaseNotOpen)
+		return Space{}, errDBClosed
 	}
 	return spaceOf(db.bolt, db.path, db.pageSize)
 }

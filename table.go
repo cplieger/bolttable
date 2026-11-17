@@ -146,11 +146,13 @@ func (t *Table[K, V]) facts(kb, vb []byte) (rowFacts, error) {
 // value that does not decode is ErrCorrupt.
 func (t *Table[K, V]) Get(r *ReadTx, k K) (v V, found bool, err error) {
 	b, err := r.rows(t.def)
-	if err != nil {
+	if err != nil || b == nil {
 		return v, false, err
 	}
 	kb := t.key.AppendKey(nil, k)
+	r.op.enter()
 	raw := b.Get(kb)
+	r.op.leave()
 	if raw == nil {
 		return v, false, nil
 	}
@@ -183,6 +185,10 @@ func (t *Table[K, V]) Delete(tx *Tx, k K) (bool, error) {
 	return tx.deleteRow(t.def, t.key.AppendKey(nil, k))
 }
 
+// Prefix returns the table's prefix byte, the first byte of each of its
+// rows' subjects.
+func (t *Table[K, V]) Prefix() byte { return t.def.prefix }
+
 // Subject returns the change-feed subject of the row under k.
 func (t *Table[K, V]) Subject(k K) Subject {
 	return t.key.AppendKey([]byte{t.def.prefix}, k)
@@ -208,10 +214,10 @@ func (t *Table[K, V]) NextID(tx *Tx) (uint64, error) {
 // write transaction fn may write the table it scans.
 func (t *Table[K, V]) Scan(r *ReadTx, rg Range, fn func(K, *V) (bool, error)) error { //nolint:gocritic // hugeParam: callers build a Range inline
 	b, err := r.rows(t.def)
-	if err != nil {
+	if err != nil || b == nil {
 		return err
 	}
-	return scanBucket(b, &cursorRange{prefix: rg.Prefix, lo: rg.From, hi: rg.To, reverse: rg.Reverse}, r.btx.Writable(),
+	return scanBucket(r, b, &cursorRange{prefix: rg.Prefix, lo: rg.From, hi: rg.To, reverse: rg.Reverse},
 		func(kb, vb []byte) (bool, error) {
 			k, err := t.key.ParseKey(bytes.Clone(kb))
 			if err != nil {

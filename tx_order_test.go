@@ -332,8 +332,8 @@ func TestWriteAfterCloseReturnsError(t *testing.T) {
 		return nil
 	})
 	for i, err := range errs {
-		if !errors.Is(err, ErrCommit) || !errors.Is(err, bbolterrors.ErrDatabaseNotOpen) {
-			t.Errorf("write %d = %v, want ErrCommit and ErrDatabaseNotOpen", i, err)
+		if !errors.Is(err, ErrClosed) || !errors.Is(err, bbolterrors.ErrDatabaseNotOpen) || errors.Is(err, ErrCommit) {
+			t.Errorf("write %d = %v, want ErrClosed and ErrDatabaseNotOpen, not ErrCommit", i, err)
 		}
 	}
 	db2 := mustOpen(t, path, f.schema, Options{})

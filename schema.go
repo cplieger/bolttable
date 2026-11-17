@@ -3,6 +3,7 @@ package bolttable
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 )
 
@@ -68,6 +69,23 @@ func Must[T any](v T, err error) T {
 		panic(err)
 	}
 	return v
+}
+
+// Prefixes returns the prefix of every non-silent table, ascending: the
+// tables whose writes record a subject. A silent table is left out.
+func (s *Schema) Prefixes() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []byte
+	for _, ns := range s.namespaces {
+		for _, td := range ns.tables {
+			if !td.silent {
+				out = append(out, td.prefix)
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // seal ends declaration; every later declaration fails.

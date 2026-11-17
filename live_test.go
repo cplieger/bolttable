@@ -1101,16 +1101,18 @@ func TestLiveSwapConcurrent(t *testing.T) {
 			}
 		})
 	}
-	for range 10 {
+	deadline := time.Now().Add(5 * time.Second)
+	for swaps := 0; swaps < 10 || ran.Load() == 0; swaps++ {
+		if time.Now().After(deadline) {
+			t.Errorf("no call ran during %d swaps", swaps)
+			break
+		}
 		if err := l.Swap(t.Context(), func() error { return nil }); err != nil {
 			t.Errorf("Swap = %v", err)
 		}
 	}
 	close(stop)
 	wg.Wait()
-	if ran.Load() == 0 {
-		t.Error("no call ran between the swaps")
-	}
 }
 
 func TestRefuseSetsErrOnClosedHandle(t *testing.T) {

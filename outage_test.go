@@ -367,17 +367,19 @@ func assertEmptyReads(t *testing.T, r *ReadTx, tb *Table[uint64, item], ix *Inde
 	}
 }
 
-// damagedUnder is a closed fixture file of 300 rows whose bucket at
-// path[0]/path[1]/... has its root page's flags overwritten. The rows make
+// damagedUnder is a closed fixture file whose bucket at path[0]/path[1]/...
+// has its root page's flags overwritten. Its 300 rows per 4 KiB of page make
 // the items table, its unique index and the change log too large to be
-// inline, and the open's own inspection reads none of their pages.
+// inline whatever the OS page size (16 KiB on darwin/arm64), and the open's
+// own inspection reads none of their pages.
 func damagedUnder(t *testing.T, f *fixture, path ...[]byte) string {
 	t.Helper()
 	file := tempPath(t)
 	db := mustOpen(t, file, f.schema, Options{Retention: 10})
+	rows := uint64(300 * db.pageSize / 4096)
 	update(t, db, func(tx *Tx) error {
-		for i := range uint64(300) {
-			if err := f.items.Put(tx, i, &item{Name: strings.Repeat("n", 40) + string(rune('a'+i%26)) + string(rune('a'+i/26))}); err != nil {
+		for i := range rows {
+			if err := f.items.Put(tx, i, &item{Name: fmt.Sprintf("%s%05d", strings.Repeat("n", 40), i)}); err != nil {
 				return err
 			}
 		}

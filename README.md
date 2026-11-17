@@ -4,7 +4,7 @@
 
 bolttable gives your Go code typed tables, declared indexes and a change feed over one bbolt file.
 
-It replaces the hand-written bucket code, index upkeep, migration ladder and startup steps that grow around a bbolt store. It depends only on bbolt, `golang.org/x/sync`, `golang.org/x/sys` and the standard library, needs Go 1.27.4 or later and is licensed under Apache-2.0. It runs on Linux, macOS and the BSDs; on Windows and other platforms, `Open`, `OpenReadOnly` and `LockPath` return an error wrapping `errors.ErrUnsupported`.
+It replaces the hand-written bucket code, index upkeep, migration ladder and startup steps that grow around a bbolt store. It depends only on bbolt, `golang.org/x/sync`, `golang.org/x/sys` and the standard library and is licensed under Apache-2.0. It runs on Linux, macOS and the BSDs; on Windows and other platforms, `Open`, `OpenReadOnly` and `LockPath` return an error wrapping `errors.ErrUnsupported`.
 
 ## Why use it
 
@@ -13,7 +13,7 @@ It replaces the hand-written bucket code, index upkeep, migration ladder and sta
 - Each transaction that changes a non-silent table records one change at the next revision. `Since` returns changes after a revision you hold, a page at a time, and `OnCommit` receives every commit in commit order.
 - Each schema namespace has its own format digest. A changed declaration fails `Open` naming only that namespace, unless your reset policy allows it: `Open` then keeps a copy of the file, empties that namespace, and the others keep their rows.
 - `Open` takes a lock file beside the data file and does every startup step under it. It removes stranded temporary files, runs your own check of the stored file before it changes anything, can move a corrupt or truncated file aside, resets, compacts and reports what it did. A second process gets `ErrLocked` after a wait you choose.
-- `Live` is one handle to a live file that every store holds in place of a `*DB`. `Swap` replaces the file under all of them while it stays locked, and hooks you register reload what you keep in memory at each open. `OpenFailure` turns an open error into a fixed class (`damaged`, `format`, `newer` or `unreadable`) for an outage page or health check that must not show error text.
+- `Live` is one handle to a live file that every store holds in place of a `*DB`. `Swap` replaces the file under all of them while it stays locked, and hooks you register reload what you keep in memory at each open. `OpenFailure` turns an open error into a fixed class (`damaged`, `format`, `newer`, `unreadable` or `unwritable`) for an outage page or health check that must not show error text.
 - `OpenReadOnly` opens a file for a report or a restore check and has no write method. `Space` reads the file's size, the bytes its data uses and the bytes bbolt can reuse, without a transaction, `Backup` copies the file while it stays open, and `WriteHealth` tracks, per class of write, whether commits are failing and since when, for a health check.
 
 Consider [storm](https://github.com/asdine/storm) or [bolthold](https://github.com/timshannon/bolthold) if you want tables from struct tags and queries built at run time, or bbolt alone for a few buckets.
@@ -86,7 +86,7 @@ err = live.Swap(ctx, func() error { return os.Rename(staged, path) })
 
 During a `Swap`, every call on the handle returns `ErrClosed` at once. `Swap` waits for the calls already running, then closes the file, runs your rename, reopens the file with the same schema and options, and runs the `OnOpen` hooks before it admits calls again. **The wait is cooperative:** no bbolt transaction reads a context inside its function, so `ctx` bounds only how long `Swap` waits and never cuts a running call short. When `ctx` ends first, `Swap` closes nothing, admits calls again and returns `ctx`'s error. A failed rename, open or hook leaves the handle closed with `Err` set. A `Swap` on a closed handle skips the close, so it can also replace a file that never opened.
 
-A writer that runs on its own schedule should treat `ErrClosed` as a skipped write, not a failure. Work that reads in one transaction and writes in a later one takes `Pin` at its start and runs on that `*DB`: after a swap it returns `ErrClosed`, so nothing read from the old file lands in the new one.
+A writer that runs on its own schedule should treat `ErrClosed` as a skipped write, not a failure. A size check reads `Space` through the handle, which answers the open file's sizes, or `ErrClosed` while no file is open or a swap is running. Work that reads in one transaction and writes in a later one takes `Pin` at its start and runs on that `*DB`: after a swap it returns `ErrClosed`, so nothing read from the old file lands in the new one.
 
 `Options.Inspect` checks a stored file in a read-only transaction before `Open` resets, compacts or creates anything, and its error refuses the open with the file left as it was. A damaged page the check reads is `ErrInvalidFile`, which `Options.InvalidFile` handles like any unreadable file, while a panic in your own check reaches you. A check that finds a version stamp above the running build's own wraps `ErrNewerBuild`, which `OpenFailure` reports as `newer`.
 
@@ -94,7 +94,7 @@ A writer that runs on its own schedule should treat `ErrClosed` as a skipped wri
 
 - `NewSchema`, `Schema.Namespace`, `Define`, `DefineIndex`, `DefineCounter`, `CascadePrefix` and `CascadeIndex` declare the layout. `Must` wraps them for package-level variables, and `Schema.Prefixes` lists the prefixes of the tables that record changes.
 - `Open` runs the open procedure that `Options.LockWait`, `Lock`, `Reset`, `Compact`, `InvalidFile` and `Inspect` set, and `DB.OpenReport` tells what it did. `LockPath` takes the same lock for your own file operations, and `OpenReadOnly` returns a `*ReadDB`.
-- `NewLive` returns a `*Live`, the swappable handle, with `OnOpen`, `Open`, `Err`, `Refuse`, `View`, `Update`, `Batch`, `Backup`, `Epoch`, `Pin`, `Swap` and `Close`. `Epoch` stays the old file's until a `Swap` or `Close` has closed it, which waits for its transactions and their commit callbacks, and is zero while no file is open.
+- `NewLive` returns a `*Live`, the swappable handle, with `OnOpen`, `Open`, `Err`, `Refuse`, `View`, `Update`, `Batch`, `Backup`, `Space`, `Epoch`, `Pin`, `Swap` and `Close`. `Epoch` stays the old file's until a `Swap` or `Close` has closed it, which waits for its transactions and their commit callbacks, and is zero while no file is open.
 - `DB.Update`, `DB.Batch` and `DB.View` run transactions. `Table` has `Get`, `Put`, `Delete`, `Scan`, `NextID`, `Subject` and `Prefix`. `Index` has `Lookup` and `Scan`, and `Counter` has `Value`. A `Range` scans a prefix, a `[From, To)` span or one `Exact` key.
 - `Tx.Mark`, `Tx.Touch` and `Tx.AfterCommit` add to a transaction's change, and `Synthetic` builds a subject that names no row. `ReadTx.Since` pages the feed and `ReadTx.Rev` reads its head. `Options.BeforeCommit` chooses what each change records.
 - `DB.Verify`, `DB.Stats`, `DB.Space` and `DB.Backup` look after the file. `WriteHealth` records write outcomes, and `Options.CommitFault` lets a test fail chosen commits.

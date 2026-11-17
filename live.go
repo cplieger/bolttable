@@ -76,11 +76,11 @@ func NewLive(path string, s *Schema, o Options) (*Live, error) { //nolint:gocrit
 
 // OnOpen registers fn to run at every open of the file, the first and each
 // swap's, in registration order and before any call is admitted. fn works
-// on db. View, Update, Batch, Backup and Pin on the handle answer ErrClosed
-// inside it; Open, Swap, Close and Refuse wait for the open it runs in, so a
-// hook never calls them. Its error closes the handle with that error, and
-// the open answers it. OnOpen after the handle's first Open or Swap panics,
-// since that hook would miss an open.
+// on db. View, Update, Batch, Backup, Space and Pin on the handle answer
+// ErrClosed inside it; Open, Swap, Close and Refuse wait for the open it
+// runs in, so a hook never calls them. Its error closes the handle with that
+// error, and the open answers it. OnOpen after the handle's first Open or
+// Swap panics, since that hook would miss an open.
 func (l *Live) OnOpen(fn func(db *DB) error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -224,6 +224,18 @@ func (l *Live) Backup(ctx context.Context, path string) error {
 	return l.call(func(db *DB) error { return db.Backup(ctx, path) })
 }
 
+// Space is (*DB).Space on the open DB; a closed or swapping handle answers
+// ErrClosed.
+func (l *Live) Space() (Space, error) {
+	var sp Space
+	err := l.call(func(db *DB) error {
+		var err error
+		sp, err = db.Space()
+		return err
+	})
+	return sp, err
+}
+
 // Epoch is the open DB's epoch, kept until that DB's close returns, which
 // waits for its transactions and the callbacks of its commits, and zero
 // while no DB is open.
@@ -330,9 +342,9 @@ func (l *Live) drain(ctx context.Context, drained chan struct{}) error {
 
 // Close refuses new calls, closes the DB as (*DB).Close does, unbinds the
 // lock and releases one NewLive took, never an adopted one. It is final:
-// every later View, Update, Batch, Backup, Pin, Open and Swap answers
-// ErrClosed, Err answers ErrClosed and Epoch zero. A second Close returns
-// nil.
+// every later View, Update, Batch, Backup, Space, Pin, Open and Swap
+// answers ErrClosed, Err answers ErrClosed and Epoch zero. A second Close
+// returns nil.
 func (l *Live) Close() error {
 	l.ops <- struct{}{}
 	defer func() { <-l.ops }()

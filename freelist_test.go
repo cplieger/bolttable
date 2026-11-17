@@ -6,15 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
-	"strings"
 	"testing"
 )
-
-// childEnv tells a re-executed test binary which side of a freelist test it
-// runs: a panic in bbolt's page checker kills the process, so the assertion
-// lives in the parent.
-const childEnv = "BOLTTABLE_FREELIST_CHILD"
 
 var leafMarker = []byte("bolttable-leaf-marker")
 
@@ -83,32 +76,6 @@ func buildCorruptFile(t *testing.T) string {
 	}
 	t.Fatal("no leaf page holds the marker")
 	return ""
-}
-
-// runChild re-executes this test binary as the named child and returns its
-// combined output and error.
-func runChild(t *testing.T, test, mode, path string) (string, error) {
-	t.Helper()
-	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^"+test+"$", "-test.count=1")
-	cmd.Env = append(os.Environ(), childEnv+"="+mode+":"+path)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
-}
-
-// childMode runs the child side when this process is one, and reports
-// whether it was.
-func childMode(t *testing.T, want string, fn func(path string) error) bool {
-	t.Helper()
-	mode, path, ok := strings.Cut(os.Getenv(childEnv), ":")
-	if !ok || mode != want {
-		return false
-	}
-	if err := fn(path); err != nil {
-		fmt.Fprintln(os.Stderr, "child:", err)
-		os.Exit(3)
-	}
-	os.Exit(0)
-	return true
 }
 
 func TestOpenDoesNotWalkFile(t *testing.T) {

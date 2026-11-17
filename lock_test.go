@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -134,8 +133,7 @@ func TestLockAcrossProcesses(t *testing.T) {
 		return
 	}
 	path := tempPath(t)
-	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestLockAcrossProcesses$", "-test.count=1")
-	cmd.Env = append(os.Environ(), childEnv+"=lock:"+path)
+	cmd := childCommand(t, "TestLockAcrossProcesses", "lock", path)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)

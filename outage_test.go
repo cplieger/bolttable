@@ -8,6 +8,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/cplieger/go/httpserver/v2"
 	"go.etcd.io/bbolt"
 )
 
@@ -94,6 +95,30 @@ func TestOpenFailureClasses(t *testing.T) {
 			t.Errorf("View = %v, class %q; want ErrClosed of class newer", err, class)
 		}
 	})
+}
+
+// An app hands OpenFailure's class to httpserver.OutagePage, which refuses
+// any spelling outside its OutageClass constants.
+func TestOpenFailureSpellingsAreOutageClasses(t *testing.T) {
+	cases := []struct {
+		err  error
+		name string
+		want httpserver.OutageClass
+	}{
+		{name: "ErrInvalidFile", err: ErrInvalidFile, want: httpserver.OutageDamaged},
+		{name: "ErrCorrupt", err: ErrCorrupt, want: httpserver.OutageDamaged},
+		{name: "ErrFormat", err: ErrFormat, want: httpserver.OutageFormat},
+		{name: "ErrNewerBuild", err: ErrNewerBuild, want: httpserver.OutageNewer},
+		{name: "any other error", err: errors.New("permission denied"), want: httpserver.OutageUnreadable},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			class, ok := OpenFailure(c.err)
+			if !ok || httpserver.OutageClass(class) != c.want {
+				t.Errorf("OpenFailure(%v) = %q, %v; want %q, true", c.err, class, ok, c.want)
+			}
+		})
+	}
 }
 
 // changingOptions makes an Open of storedFile under changingSchema reset

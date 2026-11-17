@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cplieger/go/httpserver/v2"
@@ -364,4 +365,115 @@ func assertEmptyReads(t *testing.T, r *ReadTx, tb *Table[uint64, item], ix *Inde
 	if n, err := c.Value(r); err != nil || n != 0 {
 		t.Errorf("counter = %d, %v; want 0", n, err)
 	}
+}
+
+// damagedUnder is a closed fixture file of 300 rows whose bucket at
+// path[0]/path[1]/... has its root page's flags overwritten. The rows make
+// the items table, its unique index and the change log too large to be
+// inline, and the open's own inspection reads none of their pages.
+func damagedUnder(t *testing.T, f *fixture, path ...[]byte) string {
+	t.Helper()
+	file := tempPath(t)
+	db := mustOpen(t, file, f.schema, Options{Retention: 10})
+	update(t, db, func(tx *Tx) error {
+		for i := range uint64(300) {
+			if err := f.items.Put(tx, i, &item{Name: strings.Repeat("n", 40) + string(rune('a'+i%26)) + string(rune('a'+i/26))}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := bbolt.Open(file, 0o600, &bbolt.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root uint64
+	err = raw.View(func(btx *bbolt.Tx) error {
+		b := btx.Bucket(path[0])
+		for _, name := range path[1:] {
+			b = b.Bucket(name)
+		}
+		root = uint64(b.Root())
+		return nil
+	})
+	if cerr := raw.Close(); err != nil || cerr != nil {
+		t.Fatal(err, cerr)
+	}
+	if root == 0 {
+		t.Fatalf("fixture: bucket %q is inline", path)
+	}
+	setPageFlags(t, file, root, 0xFFFF)
+	return file
+}
+
+func TestInspectOnDamagedPageIsInvalidFile(t *testing.T) {
+	f := newFixture(t)
+	rows := [][]byte{[]byte("a"), {0x10}}
+	byName := [][]byte{[]byte("a"), []byte("index:by_name")}
+	changes := [][]byte{[]byte(libBucket), keyChanges}
+	cases := []struct {
+		read func(r *ReadTx) error
+		name string
+		path [][]byte
+	}{
+		{name: "Table.Get", path: rows, read: func(r *ReadTx) error { _, _, err := f.items.Get(r, 1); return err }},
+		{name: "Table.Scan", path: rows, read: func(r *ReadTx) error {
+			return f.items.Scan(r, Range{}, func(uint64, *item) (bool, error) { return true, nil })
+		}},
+		{name: "Index.Lookup", path: byName, read: func(r *ReadTx) error {
+			_, _, _, err := f.byName.Lookup(r, []byte("absent"))
+			return err
+		}},
+		{name: "Index.Scan", path: byName, read: func(r *ReadTx) error {
+			return f.byName.Scan(r, Range{}, func([]byte, uint64, []byte) (bool, error) { return true, nil })
+		}},
+		{name: "ReadTx.Since", path: changes, read: func(r *ReadTx) error { _, err := r.Since(0, 10); return err }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := damagedUnder(t, f, c.path...)
+			before := readFile(t, path)
+			reached := false
+			inspect := func(r *ReadTx) error { reached = true; return c.read(r) }
+			defer func() {
+				if v := recover(); v != nil {
+					t.Fatalf("Open panicked: %v", v)
+				}
+			}()
+			db, err := Open(path, f.schema, Options{Retention: 10, Inspect: inspect})
+			if err == nil {
+				_ = db.Close()
+			}
+			if !reached {
+				t.Fatal("Inspect did not run")
+			}
+			if !errors.Is(err, ErrInvalidFile) || !strings.Contains(err.Error(), stepInspect) {
+				t.Errorf("Open = %v, want ErrInvalidFile naming the inspect step", err)
+			}
+			if err != nil && strings.Contains(err.Error(), "ffff") {
+				t.Errorf("the error carries bbolt's panic text: %v", err)
+			}
+			if class, ok := OpenFailure(err); class != "damaged" || !ok {
+				t.Errorf("OpenFailure = %q, %v; want damaged, true", class, ok)
+			}
+			if !bytes.Equal(before, readFile(t, path)) {
+				t.Error("the file changed")
+			}
+			assertUnlocked(t, path)
+		})
+	}
+	t.Run("moved aside", func(t *testing.T) {
+		path := damagedUnder(t, f, rows...)
+		db, err := Open(path, f.schema, Options{InvalidFile: InvalidFileMoveAside, Inspect: cases[0].read})
+		if err != nil {
+			t.Fatalf("Open = %v, want a new file", err)
+		}
+		defer func() { _ = db.Close() }()
+		if rep := db.OpenReport(); !errors.Is(rep.Invalid, ErrInvalidFile) || rep.MovedAside == "" {
+			t.Errorf("OpenReport = %+v, want the damaged file moved aside", rep)
+		}
+	})
 }

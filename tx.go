@@ -39,6 +39,9 @@ type Tx struct {
 type ReadTx struct {
 	db  *DB
 	btx *bbolt.Tx
+	// op marks each bbolt call that walks pages in Options.Inspect's
+	// transaction, where a panic there is the file's; nil elsewhere.
+	op *faultOp
 	// beforeOpen marks Options.Inspect's transaction, where a bucket the
 	// file lacks is one Open would create empty: its lookup answers a nil
 	// bucket, which every read takes as empty, in place of ErrCorrupt.
@@ -345,7 +348,9 @@ func (r *ReadTx) namespace(td *tableDef) (*bbolt.Bucket, error) {
 	if td.ns.schema != r.db.schema {
 		return nil, fmt.Errorf("bolttable: table %s is not in this file's schema", td.qname)
 	}
+	r.op.enter()
 	nsb := r.btx.Bucket([]byte(td.ns.name))
+	r.op.leave()
 	if nsb == nil && !r.beforeOpen {
 		return nil, fmt.Errorf("%w: namespace %s has no bucket", ErrCorrupt, td.ns.name)
 	}
@@ -356,7 +361,10 @@ func (r *ReadTx) buckets(td *tableDef) (ns, rows *bbolt.Bucket, err error) {
 	if ns, err = r.namespace(td); err != nil || ns == nil {
 		return nil, nil, err
 	}
-	if rows = ns.Bucket([]byte{td.prefix}); rows == nil && !r.beforeOpen {
+	r.op.enter()
+	rows = ns.Bucket([]byte{td.prefix})
+	r.op.leave()
+	if rows == nil && !r.beforeOpen {
 		return nil, nil, fmt.Errorf("%w: table %s has no bucket", ErrCorrupt, td.qname)
 	}
 	return ns, rows, nil
@@ -372,7 +380,9 @@ func (r *ReadTx) index(d *indexDef) (*bbolt.Bucket, error) {
 	if err != nil || ns == nil {
 		return nil, err
 	}
+	r.op.enter()
 	ib := ns.Bucket(d.bucket)
+	r.op.leave()
 	if ib == nil && !r.beforeOpen {
 		return nil, fmt.Errorf("%w: index %s has no bucket", ErrCorrupt, d.qname)
 	}

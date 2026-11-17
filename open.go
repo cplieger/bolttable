@@ -80,13 +80,19 @@ func (db *DB) OpenReport() OpenReport {
 // change o.Reset refuses fails with the *FormatError, the file unchanged,
 // and another holder of the lock with ErrLocked. The path follows LockPath's
 // rule and the lock its filesystem and platform limits.
-func Open(path string, s *Schema, o Options) (db *DB, err error) { //nolint:gocritic // hugeParam: callers build Options inline
+func Open(path string, s *Schema, o Options) (*DB, error) { //nolint:gocritic // hugeParam: callers build Options inline
+	return openBy(path, s, o, nil)
+}
+
+// openBy is Open run by the Live by, nil for none: only a Live's own opens
+// adopt the lock bound to it.
+func openBy(path string, s *Schema, o Options, by *Live) (db *DB, err error) { //nolint:gocritic // hugeParam: Open's Options, passed on
 	retention, err := checkOpen(path, s, &o)
 	if err != nil {
 		return nil, err
 	}
 	s.seal()
-	unlock, err := takeLock(path, o.Lock, o.LockWait)
+	unlock, err := takeLock(path, o.Lock, o.LockWait, by)
 	if err != nil {
 		return nil, err
 	}
@@ -138,11 +144,11 @@ func checkOpen(path string, s *Schema, o *Options) (uint64, error) {
 	return retention, nil
 }
 
-// takeLock takes path's lock, or adopts the caller's, and returns what
-// undoes it.
-func takeLock(path string, adopted *Lock, wait time.Duration) (func() error, error) {
+// takeLock takes path's lock, or adopts the caller's for an open by, and
+// returns what undoes it.
+func takeLock(path string, adopted *Lock, wait time.Duration, by *Live) (func() error, error) {
 	if adopted != nil {
-		if err := adopted.adopt(path); err != nil {
+		if err := adopted.adopt(path, by); err != nil {
 			return nil, err
 		}
 		return func() error { adopted.free(); return nil }, nil
@@ -252,9 +258,10 @@ func (p *opening) prepare(size int64) error {
 func (p *opening) inspect(size int64) (fe *FormatError, refused, err error) {
 	err = readOnly(p.path, stepInspect, func(bdb *bbolt.DB) error {
 		var cerr error
-		if fe, cerr = p.compare(bdb, size); cerr == nil {
-			refused = p.runInspect(bdb)
+		if fe, cerr = p.compare(bdb, size); cerr != nil {
+			return cerr
 		}
+		refused, cerr = p.runInspect(bdb)
 		return cerr
 	})
 	if refused != nil {
@@ -288,16 +295,25 @@ func (p *opening) compare(bdb *bbolt.DB, size int64) (fe *FormatError, err error
 }
 
 // runInspect runs Options.Inspect under guardFault, not guardRead: the
-// function is the app's, so only a memory fault is the file's.
-func (p *opening) runInspect(bdb *bbolt.DB) error {
+// function is the app's, so only a memory fault, or a panic in a bbolt call
+// its ReadTx marks, is the file's, returned as err. refused is fn's error.
+func (p *opening) runInspect(bdb *bbolt.DB) (refused, err error) {
 	fn := p.opts.Inspect
 	if fn == nil {
-		return nil
+		return nil, nil
 	}
 	db := &DB{schema: p.schema, retention: p.retention}
-	return guardFault(p.path, stepInspect, new(faultOp), func() error {
-		return bdb.View(func(btx *bbolt.Tx) error { return fn(&ReadTx{db: db, btx: btx, beforeOpen: true}) })
+	op := new(faultOp)
+	err = guardFault(p.path, stepInspect, op, func() error {
+		return bdb.View(func(btx *bbolt.Tx) error {
+			refused = fn(&ReadTx{db: db, btx: btx, op: op, beforeOpen: true})
+			return refused
+		})
 	})
+	if refused != nil {
+		return refused, nil
+	}
+	return nil, err
 }
 
 // readOnly runs fn over a read-only handle on path, then closes the handle,

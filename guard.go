@@ -40,6 +40,21 @@ const (
 // goroutine, so the field needs no lock.
 type faultOp struct{ inBbolt bool }
 
+// enter and leave mark a bbolt call that walks pages; a nil op, every
+// ReadTx's but Options.Inspect's, marks nothing. leave is never deferred:
+// a deferred clear runs before guardFault's recover reads the mark.
+func (op *faultOp) enter() {
+	if op != nil {
+		op.inBbolt = true
+	}
+}
+
+func (op *faultOp) leave() {
+	if op != nil {
+		op.inBbolt = false
+	}
+}
+
 // guardRead runs fn, which reads the file through bbolt, inspects it or
 // compacts it into a new file, and turns any panic or memory fault into
 // ErrInvalidFile: the inspection never panics on stored bytes

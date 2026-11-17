@@ -74,13 +74,14 @@ type Options struct {
 	// anything. Its error refuses the open, returned as is, with the file and
 	// the lock as they were. A table, index, counter, namespace or change log
 	// the file lacks reads as empty; an absent or empty file is not inspected.
-	// A memory fault reading a page is ErrInvalidFile; any other panic reaches
-	// the caller.
+	// A memory fault or a bbolt panic reading a page is ErrInvalidFile, which
+	// InvalidFile decides on; a panic in fn's own code reaches the caller.
 	Inspect func(*ReadTx) error
 	// Lock is a lock the caller took with LockPath(path, …) and still holds.
 	// Open runs under it instead of taking its own, and Close leaves it
-	// held. nil has Open take the lock and Close release it. Setting it with
-	// a non-zero LockWait is an error.
+	// held; one a Live holds fails Open with ErrLocked. nil has Open take the
+	// lock and Close release it. Setting it with a non-zero LockWait is an
+	// error.
 	Lock *Lock
 	// Reset decides what Open resets.
 	Reset ResetPolicy
@@ -214,8 +215,8 @@ func txID(btx *bbolt.Tx) uint64 {
 
 // Close closes the file, waiting for open transactions, then releases the
 // lock Open took or frees an adopted one, which stays held. A second Close
-// returns nil. Every later call answers an error matching both ErrClosed and
-// bbolt's ErrDatabaseNotOpen.
+// returns nil. Every later call that returns an error answers one matching
+// both ErrClosed and bbolt's ErrDatabaseNotOpen.
 func (db *DB) Close() error {
 	if !db.closed.CompareAndSwap(false, true) {
 		return nil

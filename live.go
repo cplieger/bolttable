@@ -19,7 +19,7 @@ const (
 var (
 	// errNotOpened is Err of a handle no Open or Swap has opened yet.
 	errNotOpened = errors.New("bolttable: handle not opened")
-	errPanicked  = errors.New("bolttable: a rename or OnOpen hook panicked")
+	errPanicked  = errors.New("bolttable: the handle's open or Swap's rename panicked")
 )
 
 // Live is the one handle to a live file. Every store of the file holds it,
@@ -29,7 +29,9 @@ type Live struct {
 	schema *Schema
 	// ops admits one Open, Swap or Close at a time; a Swap's wait for it
 	// ends with its context.
-	ops   chan struct{}
+	ops chan struct{}
+	// db is the open DB, kept while a Swap waits for the calls it serves,
+	// and nil while none is open.
 	db    *DB
 	err   error
 	path  string
@@ -48,15 +50,17 @@ type Live struct {
 
 // NewLive checks o as Open does and holds path's lock for the handle's
 // life: o.Lock when set, which the handle adopts and never releases, else
-// one it takes with LockPath(path, o.LockWait), which Close releases. It
-// opens nothing: the handle is closed until Open or Swap opens it.
+// one it takes with LockPath(path, o.LockWait), which Close releases. Until
+// Close the lock's Release fails, and an Open or NewLive under it answers
+// ErrLocked. It opens nothing: the handle is closed until Open or Swap
+// opens it.
 func NewLive(path string, s *Schema, o Options) (*Live, error) { //nolint:gocritic // hugeParam: callers build Options inline
 	if _, err := checkOpen(path, s, &o); err != nil {
 		return nil, err
 	}
 	l := &Live{path: path, schema: s, opts: o, err: errNotOpened, ops: make(chan struct{}, 1)}
 	if o.Lock != nil {
-		if err := o.Lock.check(path); err != nil {
+		if err := o.Lock.bind(path, l); err != nil {
 			return nil, err
 		}
 		return l, nil
@@ -65,15 +69,20 @@ func NewLive(path string, s *Schema, o Options) (*Live, error) { //nolint:gocrit
 	if err != nil {
 		return nil, err
 	}
+	if err := lk.bind(path, l); err != nil {
+		return nil, errors.Join(err, lk.Release())
+	}
 	l.opts.Lock, l.opts.LockWait, l.owned = lk, 0, true
 	return l, nil
 }
 
 // OnOpen registers fn to run at every open of the file, the first and each
 // swap's, in registration order and before any call is admitted. fn works
-// on db; a handle call inside it answers ErrClosed. Its error closes the
-// handle with that error, and the open answers it. OnOpen after the
-// handle's first Open or Swap panics, since that hook would miss an open.
+// on db. View, Update, Batch, Backup and Pin on the handle answer ErrClosed
+// inside it; Open, Swap, Close and Refuse wait for the open it runs in, so a
+// hook never calls them. Its error closes the handle with that error, and
+// the open answers it. OnOpen after the handle's first Open or Swap panics,
+// since that hook would miss an open.
 func (l *Live) OnOpen(fn func(db *DB) error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -103,30 +112,34 @@ func (l *Live) Open() error {
 	return l.open()
 }
 
-// open opens the file, runs the hooks and admits calls. A failure closes
-// what it opened and leaves the handle closed with the error. The caller
-// holds ops.
-func (l *Live) open() (err error) {
-	db, err := Open(l.path, l.schema, l.opts)
+// open opens the file, runs the hooks and admits calls. A failure, a panic
+// included, closes what it opened and leaves the handle closed with the
+// error. The caller holds ops.
+func (l *Live) open() error {
+	var db *DB
+	// failed stays errPanicked only when the open or a hook panics.
+	failed := errPanicked
+	defer func() {
+		if failed == nil {
+			return
+		}
+		if db != nil {
+			_ = db.Close()
+		}
+		l.fail(failed)
+	}()
+	db, err := openBy(l.path, l.schema, l.opts, l)
+	if err == nil {
+		err = l.runHooks(db)
+	}
+	failed = err
 	if err != nil {
-		l.fail(err)
 		return err
 	}
-	// errPanicked stays the outcome only when a hook panics.
-	err = errPanicked
-	defer func() {
-		if err != nil {
-			_ = db.Close()
-			l.fail(err)
-		}
-	}()
-	err = l.runHooks(db)
-	if err == nil {
-		l.mu.Lock()
-		l.db, l.state, l.err = db, liveOpen, nil
-		l.mu.Unlock()
-	}
-	return err
+	l.mu.Lock()
+	l.db, l.state, l.err = db, liveOpen, nil
+	l.mu.Unlock()
+	return nil
 }
 
 func (l *Live) runHooks(db *DB) error {
@@ -213,11 +226,12 @@ func (l *Live) Backup(ctx context.Context, path string) error {
 	return l.call(func(db *DB) error { return db.Backup(ctx, path) })
 }
 
-// Epoch is the open DB's epoch, zero while the handle is not open.
+// Epoch is the open DB's epoch, the one serving the calls in flight while a
+// Swap waits for them, and zero while no DB is open.
 func (l *Live) Epoch() [16]byte {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.state != liveOpen {
+	if l.db == nil {
 		return [16]byte{}
 	}
 	return l.db.Epoch()
@@ -279,6 +293,9 @@ func (l *Live) Swap(ctx context.Context, rename func() error) error {
 		if err := l.drain(ctx, drained); err != nil {
 			return err
 		}
+		l.mu.Lock()
+		l.db = nil
+		l.mu.Unlock()
 		if err := db.Close(); err != nil {
 			l.fail(err)
 			return err
@@ -312,8 +329,8 @@ func (l *Live) drain(ctx context.Context, drained chan struct{}) error {
 	}
 }
 
-// Close closes the DB and releases a lock NewLive took, never an adopted
-// one. It is final: every later call, Open and Swap answers ErrClosed, and
+// Close closes the DB, unbinds the lock and releases one NewLive took, never
+// an adopted one. It is final: every later call, Open and Swap answers ErrClosed, and
 // Err answers ErrClosed. A second Close returns nil.
 func (l *Live) Close() error {
 	l.ops <- struct{}{}
@@ -330,6 +347,7 @@ func (l *Live) Close() error {
 	if db != nil {
 		err = db.Close()
 	}
+	l.opts.Lock.unbind()
 	if l.owned {
 		err = errors.Join(err, l.opts.Lock.Release())
 	}

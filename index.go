@@ -84,7 +84,9 @@ func (ix *Index[K, V]) Lookup(r *ReadTx, key []byte) (k K, proj []byte, found bo
 	if err != nil || ib == nil {
 		return k, nil, false, err
 	}
+	r.op.enter()
 	v := ib.Get(key)
+	r.op.leave()
 	if v == nil {
 		return k, nil, false, nil
 	}
@@ -112,7 +114,7 @@ func (ix *Index[K, V]) Scan(r *ReadTx, rg Range, fn func(ikey []byte, k K, proj 
 		// greater key (nonUniqueEnd sorts below every escaped byte).
 		cr.prefix, cr.lo, cr.hi = escapeKey(rg.Prefix), escapeBound(rg.From), escapeBound(rg.To)
 	}
-	return scanBucket(ib, &cr, r.btx.Writable(), func(sk, sv []byte) (bool, error) {
+	return scanBucket(r, ib, &cr, func(sk, sv []byte) (bool, error) {
 		ikey, pk, proj, ok := ix.def.split(sk, sv)
 		if !ok {
 			return false, corruptIndex(ix.def.qname, sk)

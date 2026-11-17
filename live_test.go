@@ -225,6 +225,155 @@ func TestLiveSwapAnswersErrClosed(t *testing.T) {
 	}
 }
 
+func TestEpochHeldThroughSwapWait(t *testing.T) {
+	f := newFixture(t)
+	path := tempPath(t)
+	l := openLive(t, path, f.schema, Options{})
+	before := l.Epoch()
+	next := storedWith(t, f, "new")
+	entered, gate := make(chan struct{}), make(chan struct{})
+	inside, held := make(chan [16]byte, 1), make(chan error, 1)
+	go func() {
+		held <- l.View(t.Context(), func(*ReadTx) error {
+			close(entered)
+			<-gate
+			inside <- l.Epoch()
+			return nil
+		})
+	}()
+	await(t, entered, "the held View to start")
+	release := sync.OnceFunc(func() { close(gate) })
+	defer release()
+	swapped := make(chan error, 1)
+	go func() {
+		swapped <- l.Swap(t.Context(), func() error {
+			if e := l.Epoch(); e != ([16]byte{}) {
+				t.Errorf("Epoch during the rename, the old DB closed = %x, want zero", e)
+			}
+			return os.Rename(next, path)
+		})
+	}()
+	waitRefusing(t, l)
+	if got := l.Epoch(); got != before {
+		t.Errorf("Epoch outside any call while the swap waits = %x, want the open DB's %x", got, before)
+	}
+	release()
+	if got := await(t, inside, "the held View's Epoch"); got != before {
+		t.Errorf("Epoch inside a call admitted before the swap = %x, want %x", got, before)
+	}
+	if err := await(t, held, "the held View"); err != nil {
+		t.Errorf("the call in flight = %v", err)
+	}
+	if err := await(t, swapped, "Swap"); err != nil {
+		t.Fatalf("Swap = %v", err)
+	}
+	if after := l.Epoch(); after == before || after == ([16]byte{}) {
+		t.Errorf("Epoch after the swap = %x, before %x: want a new non-zero epoch", after, before)
+	}
+}
+
+func TestLiveBindsItsLock(t *testing.T) {
+	f := newFixture(t)
+	t.Run("held through the rename", func(t *testing.T) {
+		path := tempPath(t)
+		lk := mustLock(t, path)
+		l := openLive(t, path, f.schema, Options{Lock: lk})
+		next := storedWith(t, f, "new")
+		if err := l.Swap(t.Context(), func() error {
+			if err := lk.Release(); err == nil {
+				t.Error("Release of the handle's lock during the rename = nil")
+			}
+			assertLocked(t, path)
+			return os.Rename(next, path)
+		}); err != nil {
+			t.Fatalf("Swap = %v", err)
+		}
+		assertName(t, l, f, "new")
+		if err := l.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := lk.Release(); err != nil {
+			t.Errorf("Release of the adopted lock after Close = %v", err)
+		}
+	})
+	t.Run("one handle per lock", func(t *testing.T) {
+		path := tempPath(t)
+		lk := mustLock(t, path)
+		l := newLive(t, path, f.schema, Options{Lock: lk})
+		if second, err := NewLive(path, f.schema, Options{Lock: lk}); !errors.Is(err, ErrLocked) {
+			if second != nil {
+				_ = second.Close()
+			}
+			t.Errorf("NewLive on a lock another handle holds = %v, want ErrLocked", err)
+		}
+		if db, err := Open(path, f.schema, Options{Lock: lk}); !errors.Is(err, ErrLocked) {
+			if db != nil {
+				_ = db.Close()
+			}
+			t.Errorf("Open on a lock a handle holds = %v, want ErrLocked", err)
+		}
+		if err := l.Close(); err != nil {
+			t.Fatal(err)
+		}
+		again := newLive(t, path, f.schema, Options{Lock: lk})
+		if err := again.Open(); err != nil {
+			t.Errorf("Open of a handle on the lock after the first one closed = %v", err)
+		}
+	})
+}
+
+func TestInspectPanicLeavesHandleClosed(t *testing.T) {
+	f := newFixture(t)
+	// panicky's Inspect panics on its nth run, counting from 1.
+	panicky := func(n int32) Options {
+		var runs atomic.Int32
+		return Options{Inspect: func(*ReadTx) error {
+			if runs.Add(1) == n {
+				panic(testPanic("inspect"))
+			}
+			return nil
+		}}
+	}
+	assertPanicked := func(t *testing.T, l *Live, v any) {
+		t.Helper()
+		if v != testPanic("inspect") {
+			t.Errorf("recovered %v, want Inspect's panic", v)
+		}
+		if err := l.Err(); !errors.Is(err, errPanicked) {
+			t.Errorf("Err after a panicking open = %v, want errPanicked", err)
+		}
+		if err := answerNow(t, func() error { return putName(t.Context(), l, f, "x") }); !errors.Is(err, ErrClosed) || !errors.Is(err, errPanicked) {
+			t.Errorf("Update after a panicking open = %v, want ErrClosed wrapping errPanicked", err)
+		}
+	}
+	t.Run("Open", func(t *testing.T) {
+		l := newLive(t, storedWith(t, f, "old"), f.schema, panicky(1))
+		v := func() (v any) {
+			defer func() { v = recover() }()
+			_ = l.Open()
+			return nil
+		}()
+		assertPanicked(t, l, v)
+		if err := l.Open(); err != nil {
+			t.Fatalf("Open after the panic = %v", err)
+		}
+		assertName(t, l, f, "old")
+	})
+	t.Run("Swap", func(t *testing.T) {
+		l := openLive(t, storedWith(t, f, "old"), f.schema, panicky(2))
+		v := func() (v any) {
+			defer func() { v = recover() }()
+			_ = l.Swap(t.Context(), func() error { return nil })
+			return nil
+		}()
+		assertPanicked(t, l, v)
+		if err := l.Swap(t.Context(), func() error { return nil }); err != nil {
+			t.Fatalf("Swap after the panic = %v", err)
+		}
+		assertName(t, l, f, "old")
+	})
+}
+
 func TestPinnedDBClosedAfterSwap(t *testing.T) {
 	f := newFixture(t)
 	path := tempPath(t)

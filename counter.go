@@ -56,7 +56,10 @@ func (c *Counter[K, V]) Value(r *ReadTx) (int64, error) {
 	if err != nil || ns == nil {
 		return 0, err
 	}
-	return readTotal(ns, c.def)
+	r.op.enter()
+	n, err := readTotal(ns, c.def)
+	r.op.leave()
+	return n, err
 }
 
 type counterTotal struct {

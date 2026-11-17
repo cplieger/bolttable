@@ -82,23 +82,23 @@ defer cancel()
 err = live.Swap(ctx, func() error { return os.Rename(staged, path) })
 ```
 
-`NewLive` holds the lock for the handle's whole life: the `Options.Lock` you pass, which it never releases, or one it takes, which `Close` releases. A handle whose file failed to open stays usable: its calls return `ErrClosed` and `Err` says why, until an `Open` or a `Swap` opens it.
+`NewLive` holds the lock for the handle's whole life: the `Options.Lock` you pass, which it never releases, or one it takes, which `Close` releases. Until `Close`, that lock's `Release` fails, and an `Open` or a second `NewLive` under it returns `ErrLocked`. A handle whose file failed to open stays usable: its calls return `ErrClosed` and `Err` says why, until an `Open` or a `Swap` opens it.
 
 During a `Swap`, every call on the handle returns `ErrClosed` at once. `Swap` waits for the calls already running, then closes the file, runs your rename, reopens the file with the same schema and options, and runs the `OnOpen` hooks before it admits calls again. **The wait is cooperative:** no bbolt transaction reads a context inside its function, so `ctx` bounds only how long `Swap` waits and never cuts a running call short. When `ctx` ends first, `Swap` closes nothing, admits calls again and returns `ctx`'s error. A failed rename, open or hook leaves the handle closed with `Err` set. A `Swap` on a closed handle skips the close, so it can also replace a file that never opened.
 
 A writer that runs on its own schedule should treat `ErrClosed` as a skipped write, not a failure. Work that reads in one transaction and writes in a later one takes `Pin` at its start and runs on that `*DB`: after a swap it returns `ErrClosed`, so nothing read from the old file lands in the new one.
 
-`Options.Inspect` checks a stored file in a read-only transaction before `Open` resets, compacts or creates anything, and its error refuses the open with the file left as it was. A check that finds a version stamp above the running build's own wraps `ErrNewerBuild`, which `OpenFailure` reports as `newer`.
+`Options.Inspect` checks a stored file in a read-only transaction before `Open` resets, compacts or creates anything, and its error refuses the open with the file left as it was. A damaged page the check reads is `ErrInvalidFile`, which `Options.InvalidFile` handles like any unreadable file, while a panic in your own check reaches you. A check that finds a version stamp above the running build's own wraps `ErrNewerBuild`, which `OpenFailure` reports as `newer`.
 
 ## API
 
 - `NewSchema`, `Schema.Namespace`, `Define`, `DefineIndex`, `DefineCounter`, `CascadePrefix` and `CascadeIndex` declare the layout. `Must` wraps them for package-level variables, and `Schema.Prefixes` lists the prefixes of the tables that record changes.
 - `Open` runs the open procedure that `Options.LockWait`, `Lock`, `Reset`, `Compact`, `InvalidFile` and `Inspect` set, and `DB.OpenReport` tells what it did. `LockPath` takes the same lock for your own file operations, and `OpenReadOnly` returns a `*ReadDB`.
-- `NewLive` returns a `*Live`, the swappable handle, with `OnOpen`, `Open`, `Err`, `Refuse`, `View`, `Update`, `Batch`, `Backup`, `Epoch`, `Pin`, `Swap` and `Close`.
+- `NewLive` returns a `*Live`, the swappable handle, with `OnOpen`, `Open`, `Err`, `Refuse`, `View`, `Update`, `Batch`, `Backup`, `Epoch`, `Pin`, `Swap` and `Close`. `Epoch` stays the old file's while a `Swap` waits for running calls, and is zero while no file is open.
 - `DB.Update`, `DB.Batch` and `DB.View` run transactions. `Table` has `Get`, `Put`, `Delete`, `Scan`, `NextID`, `Subject` and `Prefix`. `Index` has `Lookup` and `Scan`, and `Counter` has `Value`. A `Range` scans a prefix, a `[From, To)` span or one `Exact` key.
 - `Tx.Mark`, `Tx.Touch` and `Tx.AfterCommit` add to a transaction's change, and `Synthetic` builds a subject that names no row. `ReadTx.Since` pages the feed and `ReadTx.Rev` reads its head. `Options.BeforeCommit` chooses what each change records.
 - `DB.Verify`, `DB.Stats`, `DB.Space` and `DB.Backup` look after the file. `WriteHealth` records write outcomes, and `Options.CommitFault` lets a test fail chosen commits.
-- `ErrFormat`, `ErrConflict`, `ErrCorrupt`, `ErrCommit`, `ErrPublished`, `ErrLocked`, `ErrInvalidFile`, `ErrReset`, `ErrClosed` and `ErrNewerBuild` are the errors a caller can match, with `*FormatError` and `*ConflictError` carrying the details. After `DB.Close`, every call returns an error matching both `ErrClosed` and bbolt's `ErrDatabaseNotOpen`. `OpenFailure` maps an open error to its outage class.
+- `ErrFormat`, `ErrConflict`, `ErrCorrupt`, `ErrCommit`, `ErrPublished`, `ErrLocked`, `ErrInvalidFile`, `ErrReset`, `ErrClosed` and `ErrNewerBuild` are the errors a caller can match, with `*FormatError` and `*ConflictError` carrying the details. After `DB.Close`, every call that returns an error returns one matching both `ErrClosed` and bbolt's `ErrDatabaseNotOpen`. `OpenFailure` maps an open error to its outage class.
 
 The full reference is on [pkg.go.dev](https://pkg.go.dev/github.com/cplieger/bolttable).
 

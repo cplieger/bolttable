@@ -26,7 +26,8 @@ var (
 	// failed page write keeps its *os.PathError and a failed fdatasync its
 	// syscall.Errno, but bbolt flattens a failure to grow the file to text
 	// (https://github.com/etcd-io/bbolt/blob/v1.5.0/db.go#L1245), so a caller
-	// classing causes by errno falls back to "other" when none matches.
+	// classing causes by errno falls back to "other" when none matches. A
+	// call on a closed DB answers ErrClosed instead.
 	ErrCommit = errors.New("bolttable: commit failed")
 	// ErrPublished reports that Backup linked a complete copy at its path,
 	// then failed to remove its temporary name or to fsync the directory.
@@ -48,8 +49,9 @@ var (
 	// left as it was. A file found unreadable during the reset is
 	// ErrInvalidFile instead.
 	ErrReset = errors.New("bolttable: reset failed")
-	// ErrClosed reports a call on a closed DB or ReadDB, where the error also
-	// matches bbolt's ErrDatabaseNotOpen. A writer that runs on its own
+	// ErrClosed reports a call on a closed DB or ReadDB, where it also
+	// matches bbolt's ErrDatabaseNotOpen, and a call on a Live that is closed
+	// or swapping. A writer that runs on its own
 	// schedule reads it as a skipped write, never as a storage fault: it
 	// never wraps ErrCommit.
 	ErrClosed = errors.New("bolttable: database is closed")

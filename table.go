@@ -150,7 +150,9 @@ func (t *Table[K, V]) Get(r *ReadTx, k K) (v V, found bool, err error) {
 		return v, false, err
 	}
 	kb := t.key.AppendKey(nil, k)
+	r.op.enter()
 	raw := b.Get(kb)
+	r.op.leave()
 	if raw == nil {
 		return v, false, nil
 	}
@@ -215,7 +217,7 @@ func (t *Table[K, V]) Scan(r *ReadTx, rg Range, fn func(K, *V) (bool, error)) er
 	if err != nil || b == nil {
 		return err
 	}
-	return scanBucket(b, &cursorRange{prefix: rg.Prefix, lo: rg.From, hi: rg.To, reverse: rg.Reverse}, r.btx.Writable(),
+	return scanBucket(r, b, &cursorRange{prefix: rg.Prefix, lo: rg.From, hi: rg.To, reverse: rg.Reverse},
 		func(kb, vb []byte) (bool, error) {
 			k, err := t.key.ParseKey(bytes.Clone(kb))
 			if err != nil {

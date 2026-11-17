@@ -16,7 +16,9 @@ const lockPoll = 50 * time.Millisecond
 // Lock is the exclusive process lock on a database path, the file
 // <path>.lock. The lock assumes a local filesystem (see LockPath).
 type Lock struct {
-	f        *os.File
+	f *os.File
+	// live is the handle bound to the lock for its life, nil for none.
+	live     *Live
 	path     string
 	mu       sync.Mutex
 	inUse    bool
@@ -124,16 +126,16 @@ func stop(t *time.Ticker) {
 }
 
 // Release releases the lock. A second Release returns nil. While an open DB
-// runs under the lock (Options.Lock), Release fails and the lock stays held:
-// Close the DB first.
+// runs under the lock (Options.Lock) or a Live holds it, Release fails and
+// the lock stays held: Close the DB or the Live first.
 func (l *Lock) Release() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	switch {
 	case l.released:
 		return nil
-	case l.inUse:
-		return errors.New("bolttable: Release of a lock an open DB runs under")
+	case l.inUse, l.live != nil:
+		return errors.New("bolttable: Release of a lock an open DB or a Live holds")
 	}
 	l.released = true
 	if err := errors.Join(unlockFile(l.f), l.f.Close()); err != nil {
@@ -142,26 +144,49 @@ func (l *Lock) Release() error {
 	return nil
 }
 
-// adopt marks l in use by an Open of path. A released lock or one for
-// another path is the caller's bug; one in use backs another DB.
-func (l *Lock) adopt(path string) error {
+// adopt marks l in use by an Open of path that the Live by runs, nil for
+// none. A released lock or one for another path is the caller's bug; one in
+// use backs another DB, and one bound to another Live, or to any Live when
+// by is nil, backs that handle.
+func (l *Lock) adopt(path string, by *Live) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if err := l.checkLocked(path); err != nil {
 		return err
 	}
-	if l.inUse {
+	switch {
+	case l.inUse:
 		return fmt.Errorf("%w: %s backs another open DB", ErrLocked, l.path)
+	case l.live != by:
+		return fmt.Errorf("%w: %s backs a Live", ErrLocked, l.path)
 	}
 	l.inUse = true
 	return nil
 }
 
-// check refuses l for path when an adopt of it would be the caller's bug.
-func (l *Lock) check(path string) error {
+// bind binds l to live for the handle's life, until unbind: Release fails
+// and only live's opens adopt it. It refuses l as adopt would, and a lock
+// another Live holds.
+func (l *Lock) bind(path string, live *Live) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.checkLocked(path)
+	if err := l.checkLocked(path); err != nil {
+		return err
+	}
+	switch {
+	case l.inUse:
+		return fmt.Errorf("%w: %s backs another open DB", ErrLocked, l.path)
+	case l.live != nil:
+		return fmt.Errorf("%w: %s backs another Live", ErrLocked, l.path)
+	}
+	l.live = live
+	return nil
+}
+
+func (l *Lock) unbind() {
+	l.mu.Lock()
+	l.live = nil
+	l.mu.Unlock()
 }
 
 func (l *Lock) checkLocked(path string) error {

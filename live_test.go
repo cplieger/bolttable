@@ -102,6 +102,7 @@ func liveCalls(t *testing.T, l *Live, f *fixture) map[string]func() error {
 		"Batch":  func() error { return l.Batch(t.Context(), put) },
 		"Backup": func() error { return l.Backup(t.Context(), filepath.Join(t.TempDir(), "copy.bolt")) },
 		"Pin":    func() error { _, err := l.Pin(); return err },
+		"Space":  func() error { _, err := l.Space(); return err },
 	}
 }
 
@@ -644,6 +645,9 @@ func TestOnOpenRunsBeforeCalls(t *testing.T) {
 		if _, err := l.Pin(); !errors.Is(err, ErrClosed) {
 			return fmt.Errorf("Pin inside a hook = %v, want ErrClosed", err)
 		}
+		if _, err := l.Space(); !errors.Is(err, ErrClosed) {
+			return fmt.Errorf("Space inside a hook = %v, want ErrClosed", err)
+		}
 		return db.Update(t.Context(), func(tx *Tx) error { return f.items.Put(tx, 1, &item{Name: "hook"}) })
 	})
 	l.OnOpen(func(*DB) error {
@@ -1019,6 +1023,51 @@ func TestLiveBackup(t *testing.T) {
 	}
 	cp := openLive(t, copyPath, f.schema, Options{})
 	assertName(t, cp, f, "kept")
+}
+
+// assertLiveSpace checks that l's Space is the file's at path and the
+// open DB's.
+func assertLiveSpace(t *testing.T, l *Live, path string) Space {
+	t.Helper()
+	sp, err := l.Space()
+	if err != nil {
+		t.Fatalf("Space = %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sp.FileBytes != fi.Size() {
+		t.Errorf("Space().FileBytes = %d, want the file's %d bytes", sp.FileBytes, fi.Size())
+	}
+	db, err := l.Pin()
+	if err != nil {
+		t.Fatalf("Pin = %v", err)
+	}
+	want, err := db.Space()
+	if err != nil || sp != want {
+		t.Errorf("Space() = %+v, the open DB's Space = %+v, %v", sp, want, err)
+	}
+	return sp
+}
+
+func TestLiveSpace(t *testing.T) {
+	f := newFixture(t)
+	path := tempPath(t)
+	l := openLive(t, path, f.schema, Options{})
+	before := assertLiveSpace(t, l, path)
+	next := tempPath(t)
+	db := mustOpen(t, next, f.schema, Options{})
+	fillAndThin(t, db, f)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Swap(t.Context(), moveIn(next, path)); err != nil {
+		t.Fatalf("Swap = %v", err)
+	}
+	if after := assertLiveSpace(t, l, path); after.InUseBytes <= before.InUseBytes {
+		t.Errorf("Space after swapping in a fuller file = %+v, before %+v: want the new file's", after, before)
+	}
 }
 
 // Calls racing repeated swaps either run on an open DB or answer ErrClosed.

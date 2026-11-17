@@ -122,6 +122,11 @@ func (e *faultError) Error() string { return e.err.Error() }
 // and a Batch call's earlier failed run may leave an error that its solo
 // rerun, failing to begin, never returns.
 func (db *DB) commit(ctx context.Context, w int64, through func(func(*bbolt.Tx) error) error, fn func(*bbolt.Tx, *commitSlot) error) error {
+	if !db.enterCall() {
+		return errDBClosed
+	}
+	// Deferred so a panic in fn or a callback still lets Close return.
+	defer db.exitCall()
 	if err := db.writers.Acquire(ctx, w); err != nil {
 		return err
 	}
@@ -274,7 +279,8 @@ func (tx *Tx) Touch(s Subject) {
 // AfterCommit registers fn to run once after this transaction commits, never
 // after a rollback or a discarded Batch run; for signals about silent writes.
 // It runs after OnCommit and earlier AfterCommit functions, in commit order
-// across the DB (see Options.OnCommit).
+// across the DB, under OnCommit's rules: closing the DB inside it, or Close
+// or Swap of a Live serving it, deadlocks (see Options.OnCommit).
 func (tx *Tx) AfterCommit(fn func()) {
 	tx.mustRun()
 	tx.after = append(tx.after, fn)

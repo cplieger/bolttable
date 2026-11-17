@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -57,8 +58,9 @@ type Options struct {
 	// function run in commit order across the DB, silent-only and empty
 	// commits included: each commit's callbacks return before the next
 	// commit's start. They run one at a time, outside every bbolt lock, and
-	// must not block or start a write on the same DB, which deadlocks; a View
-	// is allowed.
+	// must not block, start a write, close the DB or Close or Swap a Live
+	// serving it, each of which deadlocks; a View is allowed. Close waits
+	// for them.
 	OnCommit func(Change)
 	// CommitFault, for tests of a caller's write-fault handling, is asked
 	// once per run of every Update and Batch call whose context is not done
@@ -131,6 +133,12 @@ type DB struct {
 	writers *semaphore.Weighted
 	// unlock releases the lock Open took, or frees an adopted one.
 	unlock func() error
+	// idle closes when the last commit call in progress, callbacks
+	// included, returns during Close, which waits for it: bbolt runs a
+	// commit's callbacks after it releases the locks its own Close waits on
+	// (https://github.com/etcd-io/bbolt/blob/v1.5.0/tx.go#L275). calls counts
+	// them under callsMu.
+	idle   chan struct{}
 	report OpenReport
 	// path and pageSize are cached at open for Space, which must work
 	// after bbolt's Close.
@@ -142,6 +150,8 @@ type DB struct {
 	// difference counts commits.
 	baseTxID  uint64
 	retention uint64
+	calls     int
+	callsMu   sync.Mutex
 	epoch     [16]byte
 	closed    atomic.Bool
 }
@@ -213,15 +223,51 @@ func txID(btx *bbolt.Tx) uint64 {
 	return uint64(btx.ID()) //nolint:gosec // bbolt's Txid is a uint64 it hands out as int
 }
 
-// Close closes the file, waiting for open transactions, then releases the
-// lock Open took or frees an adopted one, which stays held. A second Close
-// returns nil. Every later call that returns an error answers one matching
-// both ErrClosed and bbolt's ErrDatabaseNotOpen.
+// Close refuses new writes, waits for the writes in progress, their
+// OnCommit and AfterCommit callbacks included, and for open transactions,
+// closes the file, then releases the lock Open took or frees an adopted one,
+// which stays held. A second Close returns nil. Every later call that returns
+// an error answers one matching both ErrClosed and bbolt's
+// ErrDatabaseNotOpen. Close from inside a transaction or a commit callback of
+// the same DB deadlocks.
 func (db *DB) Close() error {
 	if !db.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	var idle chan struct{}
+	db.callsMu.Lock()
+	if db.calls > 0 {
+		idle = make(chan struct{})
+		db.idle = idle
+	}
+	db.callsMu.Unlock()
+	if idle != nil {
+		<-idle
+	}
 	return errors.Join(db.bolt.Close(), db.unlock())
+}
+
+// enterCall admits a commit call unless Close has begun. It reads closed
+// under callsMu, so Close either refuses the call or counts it.
+func (db *DB) enterCall() bool {
+	db.callsMu.Lock()
+	defer db.callsMu.Unlock()
+	if db.closed.Load() {
+		return false
+	}
+	db.calls++
+	return true
+}
+
+// exitCall ends a commit call, waking Close at the last one.
+func (db *DB) exitCall() {
+	db.callsMu.Lock()
+	defer db.callsMu.Unlock()
+	db.calls--
+	if db.calls == 0 && db.idle != nil {
+		close(db.idle)
+		db.idle = nil
+	}
 }
 
 // Epoch returns the random identity of this open: a reader holding a

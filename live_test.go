@@ -347,6 +347,144 @@ func TestEpochHeldWhileDBCloseWaits(t *testing.T) {
 	})
 }
 
+// holdCallback starts write with an AfterCommit that blocks until release
+// and then reads l's epoch, and returns once the callback runs.
+func holdCallback(t *testing.T, f *fixture, l *Live, write func(context.Context, func(*Tx) error) error) (release func(), inside <-chan [16]byte, wrote <-chan error) {
+	t.Helper()
+	entered, gate := make(chan struct{}), make(chan struct{})
+	epoch, out := make(chan [16]byte, 1), make(chan error, 1)
+	go func() {
+		out <- write(t.Context(), func(tx *Tx) error {
+			tx.AfterCommit(func() {
+				close(entered)
+				<-gate
+				epoch <- l.Epoch()
+			})
+			return f.items.Put(tx, 1, &item{Name: "late"})
+		})
+	}()
+	await(t, entered, "the commit callback to start")
+	return sync.OnceFunc(func() { close(gate) }), epoch, out
+}
+
+// TestEpochHeldThroughCommitCallbacks pins that a transition waits for the
+// commit callbacks of a write admitted on the old DB, which bbolt runs after
+// it releases its locks, and that they read that DB's epoch.
+func TestEpochHeldThroughCommitCallbacks(t *testing.T) {
+	f := newFixture(t)
+	t.Run("Close", func(t *testing.T) {
+		l := openLive(t, tempPath(t), f.schema, Options{})
+		before := l.Epoch()
+		release, inside, wrote := holdCallback(t, f, l, l.Update)
+		defer release()
+		closed := make(chan error, 1)
+		go func() { closed <- l.Close() }()
+		waitRefusing(t, l)
+		select {
+		case err := <-closed:
+			t.Errorf("Close returned (%v) while a commit callback of a call admitted before it runs", err)
+			closed <- err
+		case <-time.After(50 * time.Millisecond):
+		}
+		release()
+		if got := await(t, inside, "the callback's Epoch"); got != before {
+			t.Errorf("Epoch inside a commit callback while Close waits = %x, want the open DB's %x", got, before)
+		}
+		if err := await(t, wrote, "the held Update"); err != nil {
+			t.Errorf("the call in flight = %v, want nil", err)
+		}
+		if err := await(t, closed, "Close"); err != nil {
+			t.Fatalf("Close = %v", err)
+		}
+		if got := l.Epoch(); got != ([16]byte{}) {
+			t.Errorf("Epoch after Close = %x, want zero", got)
+		}
+	})
+	t.Run("Swap", func(t *testing.T) {
+		path := tempPath(t)
+		l := openLive(t, path, f.schema, Options{})
+		before := l.Epoch()
+		db, err := l.Pin()
+		if err != nil {
+			t.Fatalf("Pin = %v", err)
+		}
+		release, inside, wrote := holdCallback(t, f, l, db.Update)
+		defer release()
+		next := storedWith(t, f, "new")
+		renamed, swapped := make(chan struct{}), make(chan error, 1)
+		go func() {
+			swapped <- l.Swap(t.Context(), func() error {
+				close(renamed)
+				return os.Rename(next, path)
+			})
+		}()
+		select {
+		case <-renamed:
+			t.Error("Swap ran its rename while a pinned commit's callback runs")
+		case <-time.After(50 * time.Millisecond):
+		}
+		release()
+		if got := await(t, inside, "the callback's Epoch"); got != before {
+			t.Errorf("Epoch inside a pinned commit's callback while Swap waits = %x, want the old DB's %x", got, before)
+		}
+		if err := await(t, wrote, "the pinned Update"); err != nil {
+			t.Errorf("the pinned write = %v, want nil", err)
+		}
+		if err := await(t, swapped, "Swap"); err != nil {
+			t.Fatalf("Swap = %v", err)
+		}
+		if after := l.Epoch(); after == before || after == ([16]byte{}) {
+			t.Errorf("Epoch after the swap = %x, before %x: want a new non-zero epoch", after, before)
+		}
+		assertName(t, l, f, "new")
+	})
+}
+
+// TestTransitionsWaitForOnOpen pins that Close and Swap wait for the open an
+// OnOpen hook runs in.
+func TestTransitionsWaitForOnOpen(t *testing.T) {
+	f := newFixture(t)
+	transitions := map[string]func(l *Live, path string) error{
+		"Close": func(l *Live, _ string) error { return l.Close() },
+		"Swap":  func(l *Live, path string) error { return l.Swap(t.Context(), moveIn(storedWith(t, f, "new"), path)) },
+	}
+	for name, transition := range transitions {
+		t.Run(name, func(t *testing.T) {
+			path := tempPath(t)
+			l := newLive(t, path, f.schema, Options{})
+			entered, gate := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			l.OnOpen(func(*DB) error {
+				once.Do(func() {
+					close(entered)
+					<-gate
+				})
+				return nil
+			})
+			opened := make(chan error, 1)
+			go func() { opened <- l.Open() }()
+			await(t, entered, "the OnOpen hook to start")
+			release := sync.OnceFunc(func() { close(gate) })
+			defer release()
+			done := make(chan error, 1)
+			go func() { done <- transition(l, path) }()
+			select {
+			case err := <-done:
+				t.Errorf("%s returned (%v) while an OnOpen hook runs", name, err)
+				done <- err
+			case <-time.After(50 * time.Millisecond):
+			}
+			release()
+			if err := await(t, opened, "Open"); err != nil {
+				t.Errorf("Open = %v", err)
+			}
+			if err := await(t, done, name); err != nil {
+				t.Errorf("%s = %v", name, err)
+			}
+		})
+	}
+}
+
 func TestLiveBindsItsLock(t *testing.T) {
 	f := newFixture(t)
 	t.Run("held through the rename", func(t *testing.T) {

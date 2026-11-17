@@ -30,9 +30,8 @@ type Live struct {
 	// ops admits one Open, Swap or Close at a time; a Swap's wait for it
 	// ends with its context.
 	ops chan struct{}
-	// db is the open DB, kept until its close returns: Epoch answers it to
-	// the calls and pinned transactions that close waits for. Nil while
-	// none is open.
+	// db is the open DB, kept until its close returns, so Epoch answers it
+	// to the work that close waits for. Nil while none is open.
 	db    *DB
 	err   error
 	path  string
@@ -225,8 +224,9 @@ func (l *Live) Backup(ctx context.Context, path string) error {
 	return l.call(func(db *DB) error { return db.Backup(ctx, path) })
 }
 
-// Epoch is the open DB's epoch, kept while a Swap or Close waits for the
-// calls and transactions it serves, and zero while no DB is open.
+// Epoch is the open DB's epoch, kept until that DB's close returns, which
+// waits for its transactions and the callbacks of its commits, and zero
+// while no DB is open.
 func (l *Live) Epoch() [16]byte {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -251,12 +251,12 @@ func (l *Live) Pin() (*DB, error) {
 
 // Swap replaces the file: it refuses new calls with ErrClosed, waits for the
 // calls in flight until ctx ends (then admits calls again, closes nothing and
-// answers ctx's error), closes the DB, which waits for a pinned DB's
-// transactions, calls rename, reopens the file with the same schema and
-// options, runs the OnOpen hooks and admits calls. The wait is cooperative:
-// no bbolt transaction reads ctx inside its function. A failed close, rename,
-// open or hook leaves the handle closed with Err set and answers the error.
-// On a closed handle Swap skips the close; after Close it answers ErrClosed.
+// answers ctx's error), closes the DB as (*DB).Close does, calls rename,
+// reopens the file with the same schema and options, runs the OnOpen hooks
+// and admits calls. The wait is cooperative: no bbolt transaction reads ctx
+// inside its function. A failed close, rename, open or hook leaves the
+// handle closed with Err set and answers the error. On a closed handle Swap
+// skips the close; after Close it answers ErrClosed.
 func (l *Live) Swap(ctx context.Context, rename func() error) error {
 	if rename == nil {
 		return errors.New("bolttable: Swap with a nil rename")
@@ -328,11 +328,11 @@ func (l *Live) drain(ctx context.Context, drained chan struct{}) error {
 	}
 }
 
-// Close refuses new calls, closes the DB, which waits for the transactions
-// in flight, unbinds the lock and releases one NewLive took, never an
-// adopted one. It is final: every later View, Update, Batch, Backup, Pin,
-// Open and Swap answers ErrClosed, Err answers ErrClosed and Epoch zero. A
-// second Close returns nil.
+// Close refuses new calls, closes the DB as (*DB).Close does, unbinds the
+// lock and releases one NewLive took, never an adopted one. It is final:
+// every later View, Update, Batch, Backup, Pin, Open and Swap answers
+// ErrClosed, Err answers ErrClosed and Epoch zero. A second Close returns
+// nil.
 func (l *Live) Close() error {
 	l.ops <- struct{}{}
 	defer func() { <-l.ops }()

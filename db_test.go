@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -190,4 +191,114 @@ func TestClosedDBMatchesBothSentinels(t *testing.T) {
 			t.Run(name, func(t *testing.T) { assertClosedError(t, call()) })
 		}
 	})
+}
+
+// TestCloseWaitsForCommitCallbacks pins that Close returns only after the
+// commit callbacks of a write in progress ran: bbolt runs them after it
+// releases its locks, and a View inside one is allowed.
+func TestCloseWaitsForCommitCallbacks(t *testing.T) {
+	f := newFixture(t)
+	put := func(tx *Tx) error { return f.items.Put(tx, 1, &item{Name: "x"}) }
+	cases := map[string]struct {
+		opts  func(hold func()) Options
+		write func(db *DB, hold func()) error
+	}{
+		"OnCommit": {
+			opts:  func(hold func()) Options { return Options{OnCommit: func(Change) { hold() }} },
+			write: func(db *DB, _ func()) error { return db.Update(t.Context(), put) },
+		},
+		"Update AfterCommit": {
+			write: func(db *DB, hold func()) error {
+				return db.Update(t.Context(), func(tx *Tx) error { tx.AfterCommit(hold); return put(tx) })
+			},
+		},
+		"Batch AfterCommit": {
+			write: func(db *DB, hold func()) error {
+				return db.Batch(t.Context(), func(tx *Tx) error { tx.AfterCommit(hold); return put(tx) })
+			},
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			entered, gate, viewed := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+			var db *DB
+			hold := func() {
+				close(entered)
+				<-gate
+				viewed <- db.View(t.Context(), func(*ReadTx) error { return nil })
+			}
+			var o Options
+			if c.opts != nil {
+				o = c.opts(hold)
+			}
+			db = mustOpen(t, tempPath(t), f.schema, o)
+			wrote := make(chan error, 1)
+			go func() { wrote <- c.write(db, hold) }()
+			await(t, entered, "the commit callback to start")
+			release := sync.OnceFunc(func() { close(gate) })
+			defer release()
+			closed := make(chan error, 1)
+			go func() { closed <- db.Close() }()
+			for deadline := time.Now().Add(5 * time.Second); !db.closed.Load(); time.Sleep(time.Millisecond) {
+				if time.Now().After(deadline) {
+					t.Fatal("Close never began")
+				}
+			}
+			// A write that starts while Close waits is refused at once.
+			assertClosedError(t, answerNow(t, func() error { return db.Update(t.Context(), put) }))
+			select {
+			case err := <-closed:
+				t.Errorf("Close returned (%v) while a commit callback runs", err)
+				closed <- err
+			case <-time.After(50 * time.Millisecond):
+			}
+			release()
+			if err := await(t, viewed, "the callback's View"); err != nil {
+				t.Errorf("View inside a commit callback while Close waits = %v, want nil", err)
+			}
+			if err := await(t, wrote, "the write"); err != nil {
+				t.Errorf("the write in progress = %v, want nil", err)
+			}
+			if err := await(t, closed, "Close"); err != nil {
+				t.Errorf("Close = %v", err)
+			}
+			assertClosedError(t, db.Update(t.Context(), put))
+		})
+	}
+}
+
+// TestCloseAfterPanickedWrite pins that a write whose function or callback
+// panicked leaves nothing for Close to wait on.
+func TestCloseAfterPanickedWrite(t *testing.T) {
+	f := newFixture(t)
+	cases := map[string]func(db *DB) error{
+		"Update": func(db *DB) error {
+			return db.Update(t.Context(), func(*Tx) error { panic(errBoom) })
+		},
+		"Batch": func(db *DB) error {
+			return db.Batch(t.Context(), func(*Tx) error { panic(errBoom) })
+		},
+		"AfterCommit": func(db *DB) error {
+			return db.Update(t.Context(), func(tx *Tx) error {
+				tx.AfterCommit(func() { panic(errBoom) })
+				return f.items.Put(tx, 1, &item{Name: "x"})
+			})
+		},
+	}
+	for name, write := range cases {
+		t.Run(name, func(t *testing.T) {
+			db := mustOpen(t, tempPath(t), f.schema, Options{})
+			func() {
+				defer func() {
+					if p := recover(); p != errBoom {
+						t.Errorf("recovered %v, want errBoom", p)
+					}
+				}()
+				_ = write(db)
+			}()
+			if err := answerNow(t, db.Close); err != nil {
+				t.Errorf("Close = %v", err)
+			}
+		})
+	}
 }

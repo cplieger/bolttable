@@ -399,8 +399,9 @@ func failNthSync(n int, err error) func(string) error {
 	}
 }
 
-// refuseWrites gives every writable bbolt open a read-only descriptor, so
-// its first file growth or page write fails as a full disk would.
+// refuseWrites gives each writable bbolt open that sets Options.OpenFile a
+// read-only descriptor, so its first file growth or page write fails with
+// EBADF, as a write fault would; an open without OpenFile is left as it is.
 func refuseWrites(t *testing.T) {
 	boltOpen = func(p string, mode os.FileMode, o *bbolt.Options) (*bbolt.DB, error) {
 		if open := o.OpenFile; !o.ReadOnly && open != nil {

@@ -1025,8 +1025,6 @@ func TestLiveBackup(t *testing.T) {
 	assertName(t, cp, f, "kept")
 }
 
-// assertLiveSpace checks that l's Space is the file's at path and the
-// open DB's.
 func assertLiveSpace(t *testing.T, l *Live, path string) Space {
 	t.Helper()
 	sp, err := l.Space()
@@ -1102,17 +1100,17 @@ func TestLiveSwapConcurrent(t *testing.T) {
 		})
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for swaps := 0; swaps < 10 || ran.Load() == 0; swaps++ {
-		if time.Now().After(deadline) {
-			t.Errorf("no call ran during %d swaps", swaps)
-			break
-		}
+	swaps := 0
+	for ; (swaps < 10 || ran.Load() == 0) && time.Now().Before(deadline); swaps++ {
 		if err := l.Swap(t.Context(), func() error { return nil }); err != nil {
 			t.Errorf("Swap = %v", err)
 		}
 	}
 	close(stop)
 	wg.Wait()
+	if ran.Load() == 0 {
+		t.Errorf("no call ran during %d swaps", swaps)
+	}
 }
 
 func TestRefuseSetsErrOnClosedHandle(t *testing.T) {

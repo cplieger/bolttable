@@ -6,15 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
-	"strings"
 	"testing"
 )
-
-// childEnv tells a re-executed test binary which child it runs: a panic in
-// bbolt's page checker kills the process and a file lock belongs to one, so
-// those assertions live in the parent.
-const childEnv = "BOLTTABLE_FREELIST_CHILD"
 
 var leafMarker = []byte("bolttable-leaf-marker")
 
@@ -83,42 +76,6 @@ func buildCorruptFile(t *testing.T) string {
 	}
 	t.Fatal("no leaf page holds the marker")
 	return ""
-}
-
-// childCommand re-executes this test binary as the named child of test.
-func childCommand(t *testing.T, test, mode, path string) *exec.Cmd {
-	t.Helper()
-	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^"+test+"$", "-test.count=1")
-	// Under -race each child would sleep atexit_sleep_ms (1 s by default)
-	// before exiting; a later GORACE option overrides an inherited one
-	// (https://go.dev/doc/articles/race_detector#Options).
-	gorace := strings.TrimSpace(os.Getenv("GORACE") + " atexit_sleep_ms=0")
-	cmd.Env = append(os.Environ(), childEnv+"="+mode+":"+path, "GORACE="+gorace)
-	return cmd
-}
-
-// runChild runs the named child of test and returns its combined output and
-// error.
-func runChild(t *testing.T, test, mode, path string) (string, error) {
-	t.Helper()
-	out, err := childCommand(t, test, mode, path).CombinedOutput()
-	return string(out), err
-}
-
-// childMode runs the child side when this process is one, and reports
-// whether it was.
-func childMode(t *testing.T, want string, fn func(path string) error) bool {
-	t.Helper()
-	mode, path, ok := strings.Cut(os.Getenv(childEnv), ":")
-	if !ok || mode != want {
-		return false
-	}
-	if err := fn(path); err != nil {
-		fmt.Fprintln(os.Stderr, "child:", err)
-		os.Exit(3)
-	}
-	os.Exit(0)
-	return true
 }
 
 func TestOpenDoesNotWalkFile(t *testing.T) {

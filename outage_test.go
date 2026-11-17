@@ -63,7 +63,21 @@ func TestOpenFailureClasses(t *testing.T) {
 			_, err := Open(t.TempDir(), newFixture(t).schema, Options{})
 			return err
 		}},
-		{name: "a reset that failed", err: is(fmt.Errorf("%w: disk full", ErrReset)), class: "unreadable", ok: true},
+		{name: "ErrReset", err: is(fmt.Errorf("%w: disk full", ErrReset)), class: "unwritable", ok: true},
+		{name: "a reset whose write failed", class: "unwritable", ok: true, err: func(t *testing.T) error {
+			path := storedFile(t)
+			before := readFile(t, path)
+			refuseWrites(t)
+			_, err := Open(path, fixtureAt(t, 2).schema, Options{Reset: allowAll})
+			if !errors.Is(err, ErrReset) {
+				t.Errorf("Open = %v, want ErrReset", err)
+			}
+			if !bytes.Equal(before, readFile(t, path)) {
+				t.Error("the file changed")
+			}
+			assertUnlocked(t, path)
+			return err
+		}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -110,6 +124,7 @@ func TestOpenFailureSpellingsAreOutageClasses(t *testing.T) {
 		{name: "ErrCorrupt", err: ErrCorrupt, want: httpserver.OutageDamaged},
 		{name: "ErrFormat", err: ErrFormat, want: httpserver.OutageFormat},
 		{name: "ErrNewerBuild", err: ErrNewerBuild, want: httpserver.OutageNewer},
+		{name: "ErrReset", err: ErrReset, want: httpserver.OutageUnwritable},
 		{name: "any other error", err: errors.New("permission denied"), want: httpserver.OutageUnreadable},
 	}
 	for _, c := range cases {

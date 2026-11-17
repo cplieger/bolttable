@@ -418,6 +418,7 @@ func TestEpochHeldThroughCommitCallbacks(t *testing.T) {
 				return os.Rename(next, path)
 			})
 		}()
+		waitRefusing(t, l)
 		select {
 		case <-renamed:
 			t.Error("Swap ran its rename while a pinned commit's callback runs")

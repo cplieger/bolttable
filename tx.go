@@ -115,9 +115,10 @@ type faultError struct{ err error }
 func (e *faultError) Error() string { return e.err.Error() }
 
 // commit admits the call as a writer of weight w, runs fn through bbolt's
-// Update or Batch, in btx's slot, and returns fn's error as is, or bbolt's
-// own failure wrapped in ErrCommit, or the closed DB's error. On any error it abandons the slot its
-// last run used, so later commits stop waiting on it. The run's error is told
+// Update or Batch, in btx's slot, and returns fn's error as is, bbolt's own
+// failure wrapped in ErrCommit, or the closed DB's error when Close refused
+// the call before admitting it. On any error it abandons the slot its last
+// run used, so later commits stop waiting on it. The run's error is told
 // apart by its type, never compared: a caller's error may be uncomparable,
 // and a Batch call's earlier failed run may leave an error that its solo
 // rerun, failing to begin, never returns.
@@ -156,9 +157,6 @@ func (db *DB) commit(ctx context.Context, w int64, through func(func(*bbolt.Tx) 
 	}
 	if fe, ok := errors.AsType[*faultError](err); ok {
 		return fmt.Errorf("%w: %w", ErrCommit, fe.err)
-	}
-	if errors.Is(err, bbolterrors.ErrDatabaseNotOpen) {
-		return errDBClosed
 	}
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrCommit, err)
@@ -279,8 +277,8 @@ func (tx *Tx) Touch(s Subject) {
 // AfterCommit registers fn to run once after this transaction commits, never
 // after a rollback or a discarded Batch run; for signals about silent writes.
 // It runs after OnCommit and earlier AfterCommit functions, in commit order
-// across the DB, under OnCommit's rules: closing the DB inside it, or Close
-// or Swap of a Live serving it, deadlocks (see Options.OnCommit).
+// across the DB, under OnCommit's rules, which name the DB and Live calls
+// that deadlock inside it (see Options.OnCommit).
 func (tx *Tx) AfterCommit(fn func()) {
 	tx.mustRun()
 	tx.after = append(tx.after, fn)

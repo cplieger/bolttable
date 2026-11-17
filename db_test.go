@@ -159,7 +159,7 @@ func TestClosedDBMatchesBothSentinels(t *testing.T) {
 			t.Run(name, func(t *testing.T) { assertClosedError(t, call()) })
 		}
 	})
-	// A call that passed the closed check before Close began meets bbolt's
+	// A read that passed the closed check before Close began meets bbolt's
 	// own refusal to begin a transaction.
 	t.Run("past the closed check", func(t *testing.T) {
 		db := mustOpen(t, tempPath(t), f.schema, Options{})
@@ -168,6 +168,10 @@ func TestClosedDBMatchesBothSentinels(t *testing.T) {
 		}
 		calls := failingCalls(t, db, f)
 		delete(calls, "Space") // TestSpacePastTheCloseCheck: Space reads the cached path
+		// Close waits for a write past its check: TestCloseWaitsForCommitCallbacks
+		delete(calls, "Update")
+		delete(calls, "Batch")
+		delete(calls, "Repair")
 		for name, call := range calls {
 			t.Run(name, func(t *testing.T) { assertClosedError(t, call()) })
 		}

@@ -58,9 +58,10 @@ type Options struct {
 	// function run in commit order across the DB, silent-only and empty
 	// commits included: each commit's callbacks return before the next
 	// commit's start. They run one at a time, outside every bbolt lock, and
-	// must not block, start a write, close the DB or Close or Swap a Live
-	// serving it, each of which deadlocks; a View is allowed. Close waits
-	// for them.
+	// must not block, start a write, close the DB, or call Close, Swap, Open
+	// or Refuse on a Live serving it: blocking, a write, a close, Close and
+	// Swap deadlock, and Open and Refuse deadlock while a Close or Swap of
+	// that Live runs. A View is allowed. Close waits for them.
 	OnCommit func(Change)
 	// CommitFault, for tests of a caller's write-fault handling, is asked
 	// once per run of every Update and Batch call whose context is not done

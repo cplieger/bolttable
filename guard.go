@@ -35,9 +35,9 @@ const (
 	stepReadOpen = "read-only open"
 )
 
-// faultOp marks, for guardFault, a call into bbolt that walks pages the
-// inspection never read. The guard, the marked call and its panic run on one
-// goroutine, so the field needs no lock.
+// faultOp marks, for guardFault, a call into bbolt that walks the file's
+// pages. The guard, the marked call and its panic run on one goroutine, so
+// the field needs no lock.
 type faultOp struct{ inBbolt bool }
 
 // enter and leave mark a bbolt call that walks pages; a nil op, every
@@ -69,10 +69,10 @@ func guardRead(path, step string, fn func() error) (err error) {
 	return fn()
 }
 
-// guardFault runs fn, bolttable code that writes, and turns a memory fault,
-// or any panic raised while op marks a bbolt walk, into ErrInvalidFile. It
-// re-raises any other panic before the stack unwinds, so a bolttable bug is
-// never read as a corrupt file.
+// guardFault runs fn, bolttable code that writes or the app's Inspect, and
+// turns a memory fault, or any panic raised while op marks a bbolt call, into
+// ErrInvalidFile. It re-raises any other panic before the stack unwinds, so a
+// bug in bolttable or the app is never read as a corrupt file.
 func guardFault(path, step string, op *faultOp, fn func() error) (err error) {
 	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
 	defer func() {

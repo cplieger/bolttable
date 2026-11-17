@@ -272,6 +272,81 @@ func TestEpochHeldThroughSwapWait(t *testing.T) {
 	}
 }
 
+// TestEpochHeldWhileDBCloseWaits pins that a transition keeps the old DB's
+// epoch visible until that DB's close returns: the close waits for the
+// transactions admitted before it, and they still run on that DB.
+func TestEpochHeldWhileDBCloseWaits(t *testing.T) {
+	f := newFixture(t)
+	t.Run("Close", func(t *testing.T) {
+		l := openLive(t, tempPath(t), f.schema, Options{})
+		before := l.Epoch()
+		entered, gate := make(chan struct{}), make(chan struct{})
+		inside, held := make(chan [16]byte, 1), make(chan error, 1)
+		go func() {
+			held <- l.Update(t.Context(), func(tx *Tx) error {
+				close(entered)
+				<-gate
+				inside <- l.Epoch()
+				return f.items.Put(tx, 1, &item{Name: "late"})
+			})
+		}()
+		await(t, entered, "the held Update to start")
+		release := sync.OnceFunc(func() { close(gate) })
+		defer release()
+		closed := make(chan error, 1)
+		go func() { closed <- l.Close() }()
+		waitRefusing(t, l)
+		if got := l.Epoch(); got != before {
+			t.Errorf("Epoch while Close waits for a call = %x, want the open DB's %x", got, before)
+		}
+		release()
+		if got := await(t, inside, "the held Update's Epoch"); got != before {
+			t.Errorf("Epoch inside a call admitted before Close = %x, want %x", got, before)
+		}
+		if err := await(t, held, "the held Update"); err != nil {
+			t.Errorf("the call in flight = %v, want nil", err)
+		}
+		if err := await(t, closed, "Close"); err != nil {
+			t.Fatalf("Close = %v", err)
+		}
+		if got := l.Epoch(); got != ([16]byte{}) {
+			t.Errorf("Epoch after Close = %x, want zero", got)
+		}
+	})
+	t.Run("Swap", func(t *testing.T) {
+		path := tempPath(t)
+		l := openLive(t, path, f.schema, Options{})
+		before := l.Epoch()
+		db, err := l.Pin()
+		if err != nil {
+			t.Fatalf("Pin = %v", err)
+		}
+		release, held := holdView(t, db.View)
+		defer release()
+		next := storedWith(t, f, "new")
+		swapped := make(chan error, 1)
+		go func() { swapped <- l.Swap(t.Context(), moveIn(next, path)) }()
+		waitRefusing(t, l)
+		// No call is in flight, so the swap goes straight to the close that
+		// the pinned View holds.
+		for end := time.Now().Add(50 * time.Millisecond); time.Now().Before(end); time.Sleep(time.Millisecond) {
+			if got := l.Epoch(); got != before {
+				t.Fatalf("Epoch while the swap's close waits for a pinned transaction = %x, want the open DB's %x", got, before)
+			}
+		}
+		release()
+		if err := await(t, held, "the pinned View"); err != nil {
+			t.Errorf("the pinned call in flight = %v", err)
+		}
+		if err := await(t, swapped, "Swap"); err != nil {
+			t.Fatalf("Swap = %v", err)
+		}
+		if after := l.Epoch(); after == before || after == ([16]byte{}) {
+			t.Errorf("Epoch after the swap = %x, before %x: want a new non-zero epoch", after, before)
+		}
+	})
+}
+
 func TestLiveBindsItsLock(t *testing.T) {
 	f := newFixture(t)
 	t.Run("held through the rename", func(t *testing.T) {

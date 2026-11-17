@@ -30,8 +30,9 @@ type Live struct {
 	// ops admits one Open, Swap or Close at a time; a Swap's wait for it
 	// ends with its context.
 	ops chan struct{}
-	// db is the open DB, kept while a Swap waits for the calls it serves,
-	// and nil while none is open.
+	// db is the open DB, kept until its close returns: Epoch answers it to
+	// the calls and pinned transactions that close waits for. Nil while
+	// none is open.
 	db    *DB
 	err   error
 	path  string
@@ -69,9 +70,7 @@ func NewLive(path string, s *Schema, o Options) (*Live, error) { //nolint:gocrit
 	if err != nil {
 		return nil, err
 	}
-	if err := lk.bind(path, l); err != nil {
-		return nil, errors.Join(err, lk.Release())
-	}
+	lk.live = l
 	l.opts.Lock, l.opts.LockWait, l.owned = lk, 0, true
 	return l, nil
 }
@@ -226,8 +225,8 @@ func (l *Live) Backup(ctx context.Context, path string) error {
 	return l.call(func(db *DB) error { return db.Backup(ctx, path) })
 }
 
-// Epoch is the open DB's epoch, the one serving the calls in flight while a
-// Swap waits for them, and zero while no DB is open.
+// Epoch is the open DB's epoch, kept while a Swap or Close waits for the
+// calls and transactions it serves, and zero while no DB is open.
 func (l *Live) Epoch() [16]byte {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -293,13 +292,13 @@ func (l *Live) Swap(ctx context.Context, rename func() error) error {
 		if err := l.drain(ctx, drained); err != nil {
 			return err
 		}
-		l.mu.Lock()
-		l.db = nil
-		l.mu.Unlock()
 		if err := db.Close(); err != nil {
 			l.fail(err)
 			return err
 		}
+		l.mu.Lock()
+		l.db = nil
+		l.mu.Unlock()
 	default:
 		l.opened = true
 		l.state = liveSwapping
@@ -329,9 +328,11 @@ func (l *Live) drain(ctx context.Context, drained chan struct{}) error {
 	}
 }
 
-// Close closes the DB, unbinds the lock and releases one NewLive took, never
-// an adopted one. It is final: every later call, Open and Swap answers ErrClosed, and
-// Err answers ErrClosed. A second Close returns nil.
+// Close refuses new calls, closes the DB, which waits for the transactions
+// in flight, unbinds the lock and releases one NewLive took, never an
+// adopted one. It is final: every later View, Update, Batch, Backup, Pin,
+// Open and Swap answers ErrClosed, Err answers ErrClosed and Epoch zero. A
+// second Close returns nil.
 func (l *Live) Close() error {
 	l.ops <- struct{}{}
 	defer func() { <-l.ops }()
@@ -341,12 +342,15 @@ func (l *Live) Close() error {
 		return nil
 	}
 	db := l.db
-	l.db, l.state, l.err = nil, liveFinal, ErrClosed
+	l.state, l.err = liveFinal, ErrClosed
 	l.mu.Unlock()
 	var err error
 	if db != nil {
 		err = db.Close()
 	}
+	l.mu.Lock()
+	l.db = nil
+	l.mu.Unlock()
 	l.opts.Lock.unbind()
 	if l.owned {
 		err = errors.Join(err, l.opts.Lock.Release())

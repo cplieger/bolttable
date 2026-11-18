@@ -78,6 +78,23 @@ func TestOpenFailureClasses(t *testing.T) {
 			assertUnlocked(t, path)
 			return err
 		}},
+		{name: "ErrCommit", err: is(fmt.Errorf("%w: disk full", ErrCommit)), class: "unwritable", ok: true},
+		{name: "an open hook whose commit failed", class: "unwritable", ok: true, err: func(t *testing.T) error {
+			f := newFixture(t)
+			path := storedFile(t)
+			refuseWrites(t)
+			l := newLive(t, path, f.schema, Options{})
+			l.OnOpen(func(db *DB) error {
+				return db.Update(t.Context(), func(tx *Tx) error { return f.items.Put(tx, 1, &item{Name: "x"}) })
+			})
+			err := l.Open()
+			if !errors.Is(err, ErrCommit) {
+				t.Errorf("Open = %v, want ErrCommit", err)
+			}
+			return err
+		}},
+		{name: "damaged over a failed commit", err: is(errors.Join(ErrCommit, errAppCorrupt)), class: "damaged", ok: true},
+		{name: "format over a failed commit", err: is(errors.Join(ErrCommit, &FormatError{})), class: "format", ok: true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -125,6 +142,7 @@ func TestOpenFailureSpellingsAreOutageClasses(t *testing.T) {
 		{name: "ErrFormat", err: ErrFormat, want: httpserver.OutageFormat},
 		{name: "ErrNewerBuild", err: ErrNewerBuild, want: httpserver.OutageNewer},
 		{name: "ErrReset", err: ErrReset, want: httpserver.OutageUnwritable},
+		{name: "ErrCommit", err: ErrCommit, want: httpserver.OutageUnwritable},
 		{name: "any other error", err: errors.New("permission denied"), want: httpserver.OutageUnreadable},
 	}
 	for _, c := range cases {

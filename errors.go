@@ -63,8 +63,9 @@ var (
 // OpenFailure names why a file cannot open as the outage class an app
 // reports in place of the error, checked in this order: "newer" for
 // ErrNewerBuild, "damaged" for ErrInvalidFile or ErrCorrupt, "format" for
-// ErrFormat, "unwritable" for ErrReset, and "unreadable" for any other
-// error. ok is false for nil and for ErrLocked, which is no outage.
+// ErrFormat, "unwritable" for ErrReset or ErrCommit, which a hook's write at
+// open returns, and "unreadable" for any other error. ok is false for nil
+// and for ErrLocked, which is no outage.
 func OpenFailure(err error) (class string, ok bool) {
 	switch {
 	case err == nil, errors.Is(err, ErrLocked):
@@ -75,7 +76,7 @@ func OpenFailure(err error) (class string, ok bool) {
 		return "damaged", true
 	case errors.Is(err, ErrFormat):
 		return "format", true
-	case errors.Is(err, ErrReset):
+	case errors.Is(err, ErrReset), errors.Is(err, ErrCommit):
 		return "unwritable", true
 	}
 	return "unreadable", true
